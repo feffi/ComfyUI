@@ -67,6 +67,7 @@ Each instance may pin up to 40 % of RAM; with less than ~64 GB RAM add `--disabl
 All ten core proposals that survived verification are applied, plus the audio VAE follow-up `91d15cb`. Cherry-pick in this order onto your install (8cfe5e1e); the branch is based on e9027f2, so expect conflicts where your checkout differs:
 ```
 git cherry-pick d0e865c 85d2562 da79103 dd85c0c 52ed61a 2ed15ee 84cfd41 ff0e009 ded5499 d7b3369 377a3f9 e9c38f9 e997bcb 3781fb9 91d15cb
+git cherry-pick b09048c 37b7bce   # regression tests only, no runtime change
 ```
 
 | Commit | Change | CPU check |
@@ -85,6 +86,22 @@ git cherry-pick d0e865c 85d2562 da79103 dd85c0c 52ed61a 2ed15ee 84cfd41 ff0e009 
 | `e997bcb` | Bare `try/except: pass` around the AMD init block removed; AOTriton probe skipped when `--use-pytorch-cross-attention` is set | simulator: healthy start unchanged; missing arch and Ctrl+C now surface; probe 1× → 0× with the flag |
 | `3781fb9` | `_fp16_linear_wanted` checks dtype before the cuBLAS getter, removing a torch.compile graph break per `linear_input_act` | `fullgraph=True`: break before, single graph after (bf16 and fp16) |
 | `91d15cb` | Anti-aliased audio upsample (MMAudio, LTX vocoder incl. Hann resampler, MiniMax H3 audio VAE) as one shared polyphase depthwise conv1d instead of a grouped transposed conv, which torch runs one channel at a time with MIOpen off | fp32 ≤ 2.5e-7, bf16 identical (Hann ratio 4: 1.3e-5); per-channel transposed convs 512 → 0 for 512 channels; state dict unchanged; 6 MiniMax tests pass |
+
+### Regression tests
+
+`b09048c` adds CPU unit tests for the upstreamable commits; `37b7bce` pins the conv3d reference in the single-frame test to the cuDNN path, because ComfyUI turns `torch.backends.cudnn.enabled` off on AMD at import and the reference would otherwise run the path under test. On e9027f2 (before the fixes) 20 tests fail, each on its guard; on the branch 48 pass and 1 skips (no GPU here). The full `tests-unit/comfy_test` and `comfy_extras_test` suites pass with them (648 passed, 15 skipped).
+
+| Test file | Commits | Guard (fails before the fix) |
+|---|---|---|
+| `comfy_test/test_krea2_model.py` | `d0e865c`, `377a3f9` | RMSNorm creates no fp32 intermediates; attention gets 2 K/V heads plus `enable_gqa` instead of 4 expanded heads. Patchify matches the einops layout and round trips; fused DiT forward equals the unfused one |
+| `comfy_test/test_qwen_image21_norm.py` | `dd85c0c` | `ZeroCenteredRMSNorm` creates no fp32 intermediates |
+| `comfy_test/test_vae_single_frame.py` | `ded5499`, `ff0e009` | single-frame causal conv3d with cuDNN off calls conv2d, never conv3d; Wan 2.2 head runs in strips, bit identical |
+| `comfy_test/test_audio_upsample.py` | `91d15cb` | 7 upsamplers (MMAudio r2/r3, LTX kaiser and Hann r2–4, MiniMax) never call `conv_transpose1d` and match it at T = 1, 7, 300 |
+| `comfy_test/test_ops_attention_compile.py` | `3781fb9`, `d7b3369` | `_fp16_linear_wanted` compiles with `fullgraph=True`; unmasked GQA SDPA expands K/V when no fused backend takes native GQA (GPU only, skipped on CPU) |
+| `comfy_extras_test/select_clip_device_test.py` | `2ed15ee` | `cond_stage_model` follows the retargeted patcher |
+| `main_rocm_windows_gpu_test.py` | `52ed61a` | ROCm on Windows is not forced to `CUDA_VISIBLE_DEVICES=0`; CUDA still is |
+
+The equivalence tests (round trip, fused vs unfused, upsample vs transposed conv) also pass on the old code; they guard later changes, not the original bugs. Not covered: `e9c38f9` (needs two devices), `e997bcb` (runs at `model_management` import), the sparse attention part of `d0e865c` (rejects non-CUDA tensors first), and the fork-only HIP commits `85d2562`, `da79103`, `84cfd41`. The measurement prompt (phase 1a) runs the tests on the R9700 against both builds; the baseline run is the on-hardware evidence for `d7b3369`.
 
 ### GPU checks still owed
 
@@ -163,6 +180,7 @@ Core EasyCache on H3: a third-party measurement found `end_percent` ≤ 0.70 giv
 | Attention backends per real shape (SDPA native/expanded, flash/efficient/math, kitchen int8, sol, VAE slice) | `tools/A1/attn_bench.py --device 1 --explain --profile` |
 | bf16 vs fp8 vs int8 linears, hipBLASLt vs rocBLAS, TunableOp | `tools/A2/gemm_bench.py --model <file> --tokens <n> --device 1` |
 | Top kernels per denoising step | `tools/A2/comfy_profile_step` (custom node; load via `extra_paths_profile.yaml` in the test instance only) |
+| Regression tests, patched and unpatched build (phase 1a of the measurement prompt) | `python -m pytest -p no:cacheprovider -rs <the 7 files above>` with `CUDA_VISIBLE_DEVICES=1`, `HIP_VISIBLE_DEVICES=1` |
 | Krea 2 fused kernels (`377a3f9`) | `tools/A2/krea2_block_bench.py --device 1 --tokens 4608` |
 | Model placement across cards, per-GPU peak VRAM, evictions | `tools/A3/run_placement_bench.py --model minimax\|krea2\|qi21 --placement single\|split` |
 | P2P, host bandwidth, free-memory visibility across processes, pinnable RAM | `tools/A3/vram_probe.py` |
