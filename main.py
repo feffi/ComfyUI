@@ -48,6 +48,7 @@ if __name__ == "__main__":
         and args.cuda_device is None
         and args.default_device is None
         and os.environ.get("CUDA_VISIBLE_DEVICES") is None
+        and "rocm" not in cuda_malloc.get_torch_version_noimport()  # HIP falls back to CUDA_VISIBLE_DEVICES and would hide the other AMD GPUs
     ):
         os.environ["CUDA_VISIBLE_DEVICES"] = "0"
         logging.warning("On windows we are currently forcing single GPU mode in ComfyUI due to a Nvidia related issue, if you want to disable this use: --cuda-device all")
