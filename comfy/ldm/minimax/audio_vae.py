@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import comfy.ops
+from comfy.ldm.mmaudio.vae.alias_free_torch import upsample1d
 
 ops = comfy.ops.disable_weight_init
 
@@ -87,21 +88,15 @@ class UpSample1d(nn.Module):
     def __init__(self, ratio=2, kernel_size=12):
         super().__init__()
         self.ratio = ratio
-        self.stride = ratio
         self.pad = kernel_size // ratio - 1
         self.pad_left = self.pad * ratio + (kernel_size - ratio) // 2
-        self.pad_right = self.pad * ratio + (kernel_size - ratio + 1) // 2
         self.register_buffer(
             "filter",
             kaiser_sinc_filter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=kernel_size),
         )
 
     def forward(self, x):
-        _, C, _ = x.shape
-        x = F.pad(x, (self.pad, self.pad), mode="replicate")
-        x = F.conv_transpose1d(x, comfy.ops.cast_to_input(self.filter.expand(C, -1, -1), x), stride=self.stride, groups=C).mul_(self.ratio)
-        x = x[..., self.pad_left:-self.pad_right]
-        return x
+        return upsample1d(x, self.filter, self.ratio, self.pad, self.pad_left)
 
 
 class LowPassFilter1d(nn.Module):

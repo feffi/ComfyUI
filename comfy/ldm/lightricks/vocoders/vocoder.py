@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 import comfy.ops
 import comfy.model_management
+from comfy.ldm.mmaudio.vae.alias_free_torch import upsample1d
 import numpy as np
 import math
 
@@ -89,7 +90,6 @@ class UpSample1d(nn.Module):
     def __init__(self, ratio=2, kernel_size=None, persistent=True, window_type="kaiser"):
         super().__init__()
         self.ratio = ratio
-        self.stride = ratio
 
         if window_type == "hann":
             # Uses the default Hann-windowed sinc parameters from comfy.audio.resample.
@@ -100,7 +100,6 @@ class UpSample1d(nn.Module):
             self.kernel_size = 2 * width * ratio + 1
             self.pad = width
             self.pad_left = 2 * width * ratio
-            self.pad_right = self.kernel_size - ratio
             t = (torch.arange(self.kernel_size) / ratio - width) * rolloff
             t_clamped = t.clamp(-lowpass_filter_width, lowpass_filter_width)
             window = torch.cos(t_clamped * math.pi / lowpass_filter_width / 2) ** 2
@@ -111,10 +110,7 @@ class UpSample1d(nn.Module):
                 int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
             )
             self.pad = self.kernel_size // ratio - 1
-            self.pad_left = self.pad * self.stride + (self.kernel_size - self.stride) // 2
-            self.pad_right = (
-                self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
-            )
+            self.pad_left = self.pad * ratio + (self.kernel_size - ratio) // 2
             filter = kaiser_sinc_filter1d(
                 cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=self.kernel_size
             )
@@ -122,13 +118,7 @@ class UpSample1d(nn.Module):
         self.register_buffer("filter", filter, persistent=persistent)
 
     def forward(self, x):
-        _, C, _ = x.shape
-        x = F.pad(x, (self.pad, self.pad), mode="replicate")
-        x = self.ratio * F.conv_transpose1d(
-            x, comfy.model_management.cast_to(self.filter.expand(C, -1, -1), dtype=x.dtype, device=x.device), stride=self.stride, groups=C
-        )
-        x = x[..., self.pad_left : -self.pad_right]
-        return x
+        return upsample1d(x, self.filter, self.ratio, self.pad, self.pad_left)
 
 
 class DownSample1d(nn.Module):

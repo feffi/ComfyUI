@@ -55,6 +55,25 @@ def kaiser_sinc_filter1d(cutoff, half_width, kernel_size): # return filter [1,1,
     return filter
 
 
+def upsample1d(x, kernel, ratio, pad, pad_left):
+    # replicate pad, depthwise conv_transpose1d with stride ratio, gain ratio, crop to ratio * T;
+    # done as one polyphase depthwise conv1d because without cuDNN/MIOpen torch runs a grouped
+    # transposed conv one channel at a time
+    B, C, T = x.shape
+    x = F.pad(x, (pad, pad), mode="replicate")
+    w = comfy.model_management.cast_to(kernel, dtype=x.dtype, device=x.device)[0, 0]
+    phases = []
+    for s in range(ratio):
+        base, rho = divmod(s + pad_left, ratio)
+        taps = w[rho::ratio].flip(-1)
+        phases.append((base - taps.shape[0] + 1, base, taps))
+    start = min(p[0] for p in phases)
+    width = max(p[1] for p in phases) - start + 1
+    weight = torch.stack([F.pad(taps, (lo - start, start + width - 1 - hi)) for lo, hi, taps in phases])
+    out = F.conv1d(x[..., start:start + T + width - 1], weight.repeat(C, 1).unsqueeze(1), groups=C).mul_(ratio)
+    return out.unflatten(1, (C, ratio)).transpose(-1, -2).reshape(B, C, T * ratio)
+
+
 class LowPassFilter1d(nn.Module):
     def __init__(self,
                  cutoff=0.5,
@@ -98,10 +117,8 @@ class UpSample1d(nn.Module):
         super().__init__()
         self.ratio = ratio
         self.kernel_size = int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
-        self.stride = ratio
         self.pad = self.kernel_size // ratio - 1
-        self.pad_left = self.pad * self.stride + (self.kernel_size - self.stride) // 2
-        self.pad_right = self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
+        self.pad_left = self.pad * ratio + (self.kernel_size - ratio) // 2
         filter = kaiser_sinc_filter1d(cutoff=0.5 / ratio,
                                       half_width=0.6 / ratio,
                                       kernel_size=self.kernel_size)
@@ -109,14 +126,7 @@ class UpSample1d(nn.Module):
 
     # x: [B, C, T]
     def forward(self, x):
-        _, C, _ = x.shape
-
-        x = F.pad(x, (self.pad, self.pad), mode='replicate')
-        x = self.ratio * F.conv_transpose1d(
-            x, comfy.model_management.cast_to(self.filter.expand(C, -1, -1), dtype=x.dtype, device=x.device), stride=self.stride, groups=C)
-        x = x[..., self.pad_left:-self.pad_right]
-
-        return x
+        return upsample1d(x, self.filter, self.ratio, self.pad, self.pad_left)
 
 
 class DownSample1d(nn.Module):
