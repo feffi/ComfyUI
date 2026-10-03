@@ -101,7 +101,7 @@ git cherry-pick b09048c 37b7bce   # regression tests only, no runtime change
 | `comfy_extras_test/select_clip_device_test.py` | `2ed15ee` | `cond_stage_model` follows the retargeted patcher |
 | `main_rocm_windows_gpu_test.py` | `52ed61a` | ROCm on Windows is not forced to `CUDA_VISIBLE_DEVICES=0`; CUDA still is |
 
-The equivalence tests (round trip, fused vs unfused, upsample vs transposed conv) also pass on the old code; they guard later changes, not the original bugs. Not covered: `e9c38f9` (needs two devices), `e997bcb` (runs at `model_management` import), the sparse attention part of `d0e865c` (rejects non-CUDA tensors first), and the fork-only HIP commits `85d2562`, `da79103`, `84cfd41`. The measurement prompt (phase 1a) runs the tests on the R9700 against both builds; the baseline run is the on-hardware evidence for `d7b3369`.
+The equivalence tests (round trip, fused vs unfused, upsample vs transposed conv) also pass on the old code; they guard later changes, not the original bugs. Not covered: `e9c38f9` (needs two devices), `e997bcb` (runs at `model_management` import), the sparse attention part of `d0e865c` (rejects non-CUDA tensors first; phase 1b of the measurement prompt checks it on the R9700), and the fork-only HIP commits `85d2562`, `da79103`, `84cfd41`. The measurement prompt (phase 1a) runs the tests on the R9700 against both builds; the baseline run is the on-hardware evidence for `d7b3369`.
 
 ### GPU checks still owed
 
@@ -110,6 +110,7 @@ The kitchen HIP kernels and multi-GPU paths behind these commits never ran here.
 | Commit | Check on the R9700 | If it fails |
 |---|---|---|
 | `377a3f9` | `tools/A2/krea2_block_bench.py --device 1 --tokens 4608` with `--batch 1` and `--batch 2`: fused `rel_err` near the CPU numbers above, then image diff and s/it | `git revert 377a3f9` |
+| `d0e865c` (sparse override) | Krea 2 with Model Sparse Attention (sol-attn, `verbose`) in both builds, 1024² with `min_tokens` 4096 and 2048² at the default: the log shows `sparse (1, <tokens>, <heads>, 128)` for the joint sequence; patched vs baseline diverges no more with sparse than with dense; s/it and PSNR vs dense at 2048². Baseline already ran sparse because it expanded K/V before the override | keep Krea 2 dense and fix the override in `comfy_extras/nodes_sparse_attention.py`; a full revert also drops native GQA and conflicts with `377a3f9` |
 | `da79103`, `84cfd41` | MiniMax H3 encode of a 17+ frame clip and of a single keyframe: time and peak VRAM against the previous build (`tools/A4/vae_bench.py --model minimax --op encode`) | revert both |
 | `2ed15ee`, `52ed61a` | H3 with Select CLIP Device → gpu:1: GPU 1 memory rises by the encoder size during encode, encode time drops (`tools/A3/run_placement_bench.py --model minimax --placement split`) | `--cuda-device all` as workaround for `52ed61a` |
 | `ded5499`, `ff0e009` | VAE decode at 1024² and 2048² for Krea 2 and Qwen 2.1: time and peak VRAM (`tools/A4/vae_bench.py`) | revert |
@@ -121,6 +122,7 @@ The kitchen HIP kernels and multi-GPU paths behind these commits never ran here.
 Known limits:
 - `da79103` relies on the HIP kernel accumulating in fp32. kitchen documents `fp16_conv3d` as fp16-accumulate, so this is fork-only under AGENTS.md. Re-check the disassembly when you bump comfy-kitchen.
 - The `da79103` gate (`amd_min_version(..., 3)`) also matches gfx1170/1171, which kitchen 0.2.36 does not ship kernels for. Irrelevant on your cards.
+- SolAttn_triton (Patch Sol-Attn) on Krea 2: since `d0e865c` it receives the unexpanded K/V heads plus `enable_gqa`. Whether it reads the flag is unverified, and a Triton kernel can read out of bounds instead of raising. Don't apply it to Krea 2.
 - `--default-device` still does nothing on Windows ROCm (HIP on PAL ignores device order). Use `--cuda-device N`.
 - The Wan 2.1 VAE head (Krea 2) is not stripped; ~1.7 GB columns at 1024² bf16, within its estimate.
 - `torch._dynamo.explain` does not report the graph break `3781fb9` removes; use `fullgraph=True` to see it.
