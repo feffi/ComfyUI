@@ -38,13 +38,18 @@ LATENTS_STD = [
 
 # 3D causal CNN encoder
 
+def _hip_kitchen_conv(x):
+    # the kitchen HIP fp16 conv (RDNA3+ WMMA) accumulates in fp32 like torch's conv, so it needs no fp16 accumulation opt-in
+    return torch.version.hip is not None and x.dtype == torch.float16 and comfy.model_management.amd_min_version(x.device, min_rdna_version=3)
+
+
 def _kitchen_ndhwc(x):
     # NDHWC when the kitchen pad kernel can feed it and the conv consumes it natively:
     # cuDNN does; on ROCm only the kitchen fp16 conv does, torch's conv converts back and loses more than the fused pad saves
     ck = getattr(comfy.quant_ops, "ck", None)
     return (ck is not None and hasattr(ck, "group_norm_silu_pad3d")
-            and (torch.version.hip is None or comfy.ops._fp16_linear_wanted(x))
-            and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16))
+            and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16)
+            and (torch.version.hip is None or _hip_kitchen_conv(x)))
 
 
 def _fused_norm_pad(x, norm, spatial_pad, front):
@@ -63,9 +68,9 @@ def _fused_norm_pad(x, norm, spatial_pad, front):
 
 
 def _fp16_accum_conv(conv, x, weight, bias, residual):
-    # kitchen fp16-accumulate conv, same opt-in as the fp16 GEMMs
+    # kitchen fp16-accumulate conv, same opt-in as the fp16 GEMMs; default on HIP
     ck = comfy.quant_ops.ck
-    if not hasattr(ck, "fp16_conv3d") or not comfy.ops._fp16_linear_wanted(x):
+    if not hasattr(ck, "fp16_conv3d") or not (_hip_kitchen_conv(x) or comfy.ops._fp16_linear_wanted(x)):
         return None
     return ck.fp16_conv3d(x, weight, bias, residual, conv.stride)
 
