@@ -4,7 +4,7 @@ Paste everything below the line into Claude Code on the R9700 machine, started i
 
 ---
 
-You are running a measurement session on a Windows machine with two AMD Radeon AI PRO R9700 (gfx1201). An earlier static analysis produced 14 ComfyUI commits and a list of launch and system recommendations, all verified on CPU only. Your job is to measure them on this hardware, decide keep/revert per commit, and turn the estimates into numbers. Correctness first, then speed.
+You are running a measurement session on a Windows machine with two AMD Radeon AI PRO R9700 (gfx1201). An earlier static analysis produced 15 ComfyUI commits, a commit of regression tests for them and a list of launch and system recommendations, all verified on CPU only. Your job is to measure them on this hardware, decide keep/revert per commit, and turn the estimates into numbers. Correctness first, then speed.
 
 ## Known stack (verify, report any drift)
 
@@ -15,7 +15,7 @@ You are running a measurement session on a Windows machine with two AMD Radeon A
 
 ## Hard rules
 
-1. **Never modify the production install.** No `pip`/`uv` installs, upgrades or removals in `.venv-rocm-100`. No edits to the production ComfyUI checkout. All code under test lives in two git worktrees (below).
+1. **Never modify the production install.** No `pip`/`uv` installs, upgrades or removals in `.venv-rocm-100`. No edits to the production ComfyUI checkout. All code under test lives in git worktrees (below).
 2. **Never change system settings.** No driver installs, registry edits (TDR), Defender exclusions, power plans or BIOS. Report them as recommendations only.
 3. **Do not stop or restart the production ComfyUI instance yourself.** If it is running and holding a GPU, ask me to stop it before the GPU phases. Test instances use ports 8198 and 8199 only.
 4. **One GPU workload at a time per card.** Never run two benchmarks on the same GPU concurrently, and never benchmark while another process uses that card (check with the device query in phase 0 before every block of runs). Subagents may only do work that does not touch the GPUs: reading code, parsing logs, writing the report.
@@ -33,6 +33,9 @@ You are running a measurement session on a Windows machine with two AMD Radeon A
   git -C <PROD> worktree add <WT>\baseline 8cfe5e1e
   git -C <PROD> worktree add <WT>\patched 8cfe5e1e
   git -C <WT>\patched cherry-pick d0e865c 85d2562 da79103 dd85c0c 52ed61a 2ed15ee 84cfd41 ff0e009 ded5499 d7b3369 377a3f9 e9c38f9 e997bcb 3781fb9 91d15cb
+  git -C <WT>\patched cherry-pick b09048c 37b7bce        # regression tests only, no runtime change
+  git -C <PROD> worktree add <WT>\tests-baseline 8cfe5e1e
+  git -C <WT>\tests-baseline cherry-pick b09048c 37b7bce  # the same tests against unpatched code
   git -C <PROD> show feffi/claude/cool-euler-0g3imw:.claude/reports/r9700-analysis.md > <RESULTS>\analysis.md
   git -C <PROD> archive feffi/claude/cool-euler-0g3imw .claude/reports/r9700/tools | tar -x -C <RESULTS>
   ```
@@ -60,6 +63,32 @@ You are running a measurement session on a Windows machine with two AMD Radeon A
 **Gate.** If the startup log shows sub-quadratic attention, this is the top finding. Run `tools\A1\attn_bench.py --device 1 --explain` for the three models' shapes and add a launch variant with `--use-pytorch-cross-attention` to phases 2 and 4. ComfyUI#16526 crashed only on Anima's direct SDPA call, so SDPA may work for these three models even though the probe fails. Check the output correctness of that variant before trusting its speed.
 
 ## Phase 1: correctness of the commits
+
+### 1a. Regression tests
+
+Run these before any workflow. They are CPU unit tests plus one small SDPA call on the GPU, so card 1 only has to be idle (phase 0 device query). Use the production venv's python, set `CUDA_VISIBLE_DEVICES=1` and `HIP_VISIBLE_DEVICES=1` for the test process only, and run from `<WT>\patched`, then from `<WT>\tests-baseline`:
+```
+python -m pytest -p no:cacheprovider -rs tests-unit\comfy_test\test_krea2_model.py tests-unit\comfy_test\test_qwen_image21_norm.py tests-unit\comfy_test\test_vae_single_frame.py tests-unit\comfy_test\test_audio_upsample.py tests-unit\comfy_test\test_ops_attention_compile.py tests-unit\comfy_extras_test\select_clip_device_test.py tests-unit\main_rocm_windows_gpu_test.py
+```
+Save the output to `<RESULTS>\logs\unit-tests-<worktree>.log`. If `import pytest` fails in the production venv, run `python -m pip install --target <RESULTS>\pydeps pytest` and put `<RESULTS>\pydeps` on `PYTHONPATH` for these runs. Never install into the venv.
+
+| Test file | Guards |
+|---|---|
+| `test_krea2_model.py` | `d0e865c` (norm dtype, unexpanded GQA K/V, patchify layout), `377a3f9` (fused = unfused) |
+| `test_qwen_image21_norm.py` | `dd85c0c` |
+| `test_vae_single_frame.py` | `ded5499`, `ff0e009` |
+| `test_audio_upsample.py` | `91d15cb` |
+| `test_ops_attention_compile.py` | `3781fb9`; `d7b3369` (the only GPU test) |
+| `select_clip_device_test.py` | `2ed15ee` |
+| `main_rocm_windows_gpu_test.py` | `52ed61a` |
+
+Pass conditions:
+- **patched:** everything passes and nothing is skipped. A skipped `test_unmasked_gqa_without_native_backend_expands_kv` means the test process sees no GPU: fix the environment and rerun. A failure marks the guarded commit **revert**, unless it is a Windows harness problem (path, shell, encoding), which you fix in the worktree copy and log as with the tools. A commit you did not apply fails its tests by design; list those failures as such.
+- **tests-baseline:** each commit's guard fails and the equivalence tests pass. The GQA SDPA test failing here is the on-hardware evidence for `d7b3369`: with the baseline wrapper, unmasked fp32 GQA reaches torch SDPA unexpanded although no fused backend takes it, so it runs on the math kernel. If that test passes on baseline, record why from the log; `d7b3369` then has no effect on this stack.
+
+Commits without a unit test (`85d2562`, `da79103`, `84cfd41`, `e9c38f9`, `e997bcb`) rely on the GPU checks below.
+
+### 1b. GPU checks
 
 Per commit group, compare patched against baseline (and against the noise floor):
 
@@ -122,7 +151,7 @@ Each against the phase 2 patched result, same workflows:
 
 Write `<RESULTS>\r9700-measurements.md` (under 300 lines) and keep `results.jsonl` with every raw run. Lead each section with the decision:
 
-1. **Verdict table per commit:** keep / revert / inconclusive, with the correctness numbers and the speed effect in its workload.
+1. **Verdict table per commit:** keep / revert / inconclusive, with the unit test result (patched and tests-baseline), the correctness numbers and the speed effect in its workload.
 2. **Gates:** attention backend state and reason, idle page-out yes/no, device visibility.
 3. **Per workload:** baseline vs patched for s/it, total, VAE, text encode, peak VRAM per GPU, PSNR vs noise floor.
 4. **Recommended launch configuration and two-GPU plan**, updated with measured numbers, each line marked measured or not measured.
@@ -132,4 +161,4 @@ Write `<RESULTS>\r9700-measurements.md` (under 300 lines) and keep `results.json
 8. **Corrections** to the analysis report: every estimate that the measurements contradict.
 9. **Not measured:** what you skipped and why.
 
-Do not commit or push anything. When finished, leave both worktrees in place and tell me the cleanup commands (`git worktree remove`) instead of running them.
+Do not commit or push anything. When finished, leave all worktrees in place (baseline, patched, tests-baseline and any bisect ones) and tell me the cleanup commands (`git worktree remove`) instead of running them.
