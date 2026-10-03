@@ -15,7 +15,7 @@ Target: Windows, Adrenalin 26.8.1, TheRock ROCm 10.0 wheels (HIP 7.15), torch 2.
 | 3 | Make GPU 1 usable: both cards visible, text encoder really on GPU 1 | core | all, H3 most | GPU 1 was hidden by the Windows NVIDIA workaround, and Select CLIP Device encoded with the original model. High confidence (source + CPU repro) | done: `52ed61a`, `2ed15ee` |
 | 4 | MiniMax H3 VAE encode through the kitchen HIP conv | core | H3 | Removes a ~7.7 GB im2col buffer per 256 px × 17-frame tile and ~300k launches per 1024² keyframe. Kernel accumulates in fp32 (disassembly) | done: `85d2562`, `da79103`, `84cfd41` |
 | 5 | Replace SolAttn_triton with core **Model Sparse Attention** (method sol) | extension | H3 | SolAttn_triton is deprecated (26d816e is the deprecation commit), Triton JIT, NVIDIA-tested only; core node runs precompiled HIP `sol_attn`. Speed unmeasured | A/B, then remove |
-| 6 | Single-frame VAE convs as conv2d with MIOpen off; Qwen 2.1 decoder head in strips | core | Krea 2, Qwen 2.1, H3 bf16 | Removes ~8.7k (Krea 2) / ~68.6k (Qwen 2.1) bias-fill launches per 1024² decode; Qwen head scratch 2.5 GiB → 0.3 GiB at 1024². Output identical within 1e-6 | done: `ded5499`, `ff0e009` |
+| 6 | Conv fallbacks with MIOpen off: single-frame VAE convs as conv2d, Qwen 2.1 decoder head in strips, polyphase audio upsample | core | Krea 2, Qwen 2.1, H3 (video bf16, audio) | Removes ~8.7k (Krea 2) / ~68.6k (Qwen 2.1) bias-fill launches per 1024² decode; Qwen head scratch 2.5 GiB → 0.3 GiB at 1024²; 18,296 per-channel transposed convs per H3 audio decode (same loop in the LTX and MMAudio vocoders). Output identical within 1e-6 | done: `ded5499`, `ff0e009`, `91d15cb` |
 | 7 | Krea 2 attention, norms and modulation | core | Krea 2 | Native GQA (no 4× K/V copies), no fp32 norm copies, GQA guard for fp32/no-flash, fused RMS AdaLN and RMS RoPE kernels (~3 % per step, est.) | done: `d0e865c`, `d7b3369`, `377a3f9` |
 | 8 | No bare `--fast`, no `--fast fp16_accumulation` | launch | Krea 2 | torch 2.13 ignores `allow_fp16_accumulation` on ROCm (verified in `CUDABlas.cpp`). The flag only moves Krea 2 to fp16, which has no clamp. No speed gain, NaN risk | **do now** |
 | 9 | One ComfyUI instance per card for Krea 2 / Qwen 2.1 | launch | Krea 2, Qwen 2.1 | Templates run cfg=1, so CFG Split leaves GPU 1 idle. Two queues ≈ 2× images/hour (est.) | try |
@@ -64,9 +64,9 @@ Each instance may pin up to 40 % of RAM; with less than ~64 GB RAM add `--disabl
 
 ### On the branch (verified by V1, CPU-tested)
 
-All ten core proposals that survived verification are applied. Cherry-pick in this order onto your install (8cfe5e1e); the branch is based on e9027f2, so expect conflicts where your checkout differs:
+All ten core proposals that survived verification are applied, plus the audio VAE follow-up `91d15cb`. Cherry-pick in this order onto your install (8cfe5e1e); the branch is based on e9027f2, so expect conflicts where your checkout differs:
 ```
-git cherry-pick d0e865c 85d2562 da79103 dd85c0c 52ed61a 2ed15ee 84cfd41 ff0e009 ded5499 d7b3369 377a3f9 e9c38f9 e997bcb 3781fb9
+git cherry-pick d0e865c 85d2562 da79103 dd85c0c 52ed61a 2ed15ee 84cfd41 ff0e009 ded5499 d7b3369 377a3f9 e9c38f9 e997bcb 3781fb9 91d15cb
 ```
 
 | Commit | Change | CPU check |
@@ -84,6 +84,7 @@ git cherry-pick d0e865c 85d2562 da79103 dd85c0c 52ed61a 2ed15ee 84cfd41 ff0e009 
 | `e9c38f9` | MultiGPU CFG Split scheduler counts DynamicVRAM-evictable memory like the single-GPU path | identical to before without aimdo |
 | `e997bcb` | Bare `try/except: pass` around the AMD init block removed; AOTriton probe skipped when `--use-pytorch-cross-attention` is set | simulator: healthy start unchanged; missing arch and Ctrl+C now surface; probe 1× → 0× with the flag |
 | `3781fb9` | `_fp16_linear_wanted` checks dtype before the cuBLAS getter, removing a torch.compile graph break per `linear_input_act` | `fullgraph=True`: break before, single graph after (bf16 and fp16) |
+| `91d15cb` | Anti-aliased audio upsample (MMAudio, LTX vocoder incl. Hann resampler, MiniMax H3 audio VAE) as one shared polyphase depthwise conv1d instead of a grouped transposed conv, which torch runs one channel at a time with MIOpen off | fp32 ≤ 2.5e-7, bf16 identical (Hann ratio 4: 1.3e-5); per-channel transposed convs 512 → 0 for 512 channels; state dict unchanged; 6 MiniMax tests pass |
 
 ### GPU checks still owed
 
@@ -95,6 +96,7 @@ The kitchen HIP kernels and multi-GPU paths behind these commits never ran here.
 | `da79103`, `84cfd41` | MiniMax H3 encode of a 17+ frame clip and of a single keyframe: time and peak VRAM against the previous build (`tools/A4/vae_bench.py --model minimax --op encode`) | revert both |
 | `2ed15ee`, `52ed61a` | H3 with Select CLIP Device → gpu:1: GPU 1 memory rises by the encoder size during encode, encode time drops (`tools/A3/run_placement_bench.py --model minimax --placement split`) | `--cuda-device all` as workaround for `52ed61a` |
 | `ded5499`, `ff0e009` | VAE decode at 1024² and 2048² for Krea 2 and Qwen 2.1: time and peak VRAM (`tools/A4/vae_bench.py`) | revert |
+| `91d15cb` | MiniMax H3 audio decode of a 10 s and a 60 s clip in both builds: time and waveform diff; LTX audio if you use it | revert |
 | `e9c38f9` | CFG Split with cfg > 1 and batch 2: s/it (`run_placement_bench.py --cfg 4 --cfg-split`) | revert |
 | `e997bcb` | startup log on both cards still reports the expected attention line | revert |
 | `3781fb9` | only with TorchCompileModel (`tools/A5/ab_compile.py --variants baseline,torch_compile`) | none needed for eager runs |
@@ -105,11 +107,12 @@ Known limits:
 - `--default-device` still does nothing on Windows ROCm (HIP on PAL ignores device order). Use `--cuda-device N`.
 - The Wan 2.1 VAE head (Krea 2) is not stripped; ~1.7 GB columns at 1024² bf16, within its estimate.
 - `torch._dynamo.explain` does not report the graph break `3781fb9` removes; use `fullgraph=True` to see it.
+- Audio: the 42 dilated convs per H3 audio decode still cost 12,192 per-channel bias fills with MIOpen off (7,936 more per reference-audio encode). Measure their share before fixing.
 
 ### Upstream items worth filing
 
 - comfy-kitchen: document per-backend accumulation (HIP fp16 conv/GEMM accumulate in fp32), bf16 HIP conv3d (would move Krea 2 / Qwen VAEs off torch's fallback), `sol_attn` with Lq≠Lk and native GQA (Qwen 2.1 sparse), hardware fp8 convert in the HIP quantize kernel (`v_cvt_pk_fp8_f32`), kitchen#184 (HIP sol paired query blocks, +18–20 % on gfx1201).
-- PyTorch: `slow_conv_dilated` writes bias with one kernel per output channel and builds columns for 1×1 (`NaiveDilatedConvolution.cu`); port the `slow_conv2d` behaviour. Covers multi-frame video VAE decode, which `ded5499` does not.
+- PyTorch: `slow_conv_dilated` writes bias with one kernel per output channel and builds columns for 1×1 (`NaiveDilatedConvolution.cu`); port the `slow_conv2d` behaviour. Covers multi-frame video VAE decode, which `ded5499` does not. Grouped convs on the slow backends (`SlowTranspose2d`, `Slow2d`, `SlowDilated*`) run one conv per group (`Convolution.cpp` group loop); `91d15cb` avoids it for the audio upsample only.
 - ROCm: HIP on PAL ignores `HIP_VISIBLE_DEVICES` order; AOTriton 0.14 gfx1201 kernels landed in release/2.13 after the 10.0.0 wheels.
 
 ## 5. Startup
@@ -150,7 +153,7 @@ Core EasyCache on H3: a third-party measurement found `end_percent` ≤ 0.70 giv
 
 ## 7. Benchmark protocol
 
-Run against a separate instance (`--port 8199`), on GPU 1 when GPU 0 is busy. 3 runs, report the median. Record driver, ROCm wheel, HIP, torch, comfy-kitchen, comfy-aimdo and ComfyUI commit with every number (`tools/A6/a6_stability_check.py` prints them).
+`.claude/prompts/r9700-measurement-run.md` runs this whole protocol on the R9700 machine and returns a keep/revert verdict per commit. Run against a separate instance (`--port 8199`), on GPU 1 when GPU 0 is busy. 3 runs, report the median. Record driver, ROCm wheel, HIP, torch, comfy-kitchen, comfy-aimdo and ComfyUI commit with every number (`tools/A6/a6_stability_check.py` prints them).
 
 | Question | Tool |
 |---|---|
