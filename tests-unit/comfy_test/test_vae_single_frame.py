@@ -21,7 +21,8 @@ def _randomize(module, seed=0):
 def test_single_frame_causal_conv3d_runs_as_conv2d(kernel, stride, groups, monkeypatch):
     conv = _randomize(CausalConv3d(4, 6, kernel, stride=stride, padding=tuple(k // 2 for k in kernel), groups=groups))
     x = torch.randn(2, 4, 1, 9, 10)
-    reference = conv(x)  # cuDNN flag on: the conv3d path
+    with torch.backends.cudnn.flags(enabled=True):  # the conv3d path; ComfyUI turns the flag off on AMD
+        reference = conv(x)
 
     calls = {"conv2d": 0}
     conv2d = F.conv2d
