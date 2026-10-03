@@ -614,6 +614,9 @@ class disable_weight_init:
         def _conv_forward(self, input, weight, bias, autopad=None, *args, **kwargs):
             if autopad == "causal_zero":
                 weight = weight[:, :, -input.shape[2]:, :, :]
+                if input.shape[2] == 1 and not torch.backends.cudnn.enabled:
+                    # one frame is a 2D conv; torch's conv3d fallback fills the bias per channel and builds columns even for 1x1
+                    return torch.nn.functional.conv2d(input[:, :, 0], weight[:, :, 0], bias, self.stride[1:], self.padding[1:], self.dilation[1:], self.groups).unsqueeze(2)
             if NVIDIA_MEMORY_CONV_BUG_WORKAROUND and weight.dtype in (torch.float16, torch.bfloat16):
                 out = torch.cudnn_convolution(input, weight, self.padding, self.stride, self.dilation, self.groups, benchmark=False, deterministic=False, allow_tf32=True)
                 if bias is not None:
