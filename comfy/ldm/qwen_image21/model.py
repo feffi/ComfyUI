@@ -17,15 +17,15 @@ from comfy.ldm.wan.model_animate2 import PoseBranchCache
 
 
 class ZeroCenteredRMSNorm(nn.Module):
-    # stored weight is scale - 1, applied in fp32
+    # stored weight is scale - 1
     def __init__(self, dim, eps=1e-6, dtype=None, device=None):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(dim, dtype=dtype, device=device))
         self.eps = eps
 
     def forward(self, x):
-        w = comfy.model_management.cast_to(self.weight, dtype=torch.float32, device=x.device) + 1.0
-        return comfy.rmsnorm.rms_norm(x.float(), w, self.eps).to(x.dtype)
+        w = comfy.model_management.cast_to(self.weight, dtype=x.dtype, device=x.device) + 1.0
+        return comfy.rmsnorm.rms_norm(x, w, self.eps)
 
 
 class TextProjection(nn.Module):
