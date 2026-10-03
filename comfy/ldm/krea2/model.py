@@ -10,7 +10,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 
 import comfy.model_management
 import comfy.patcher_extension
@@ -30,9 +29,8 @@ class RMSNorm(nn.Module):
         self.scale = nn.Parameter(torch.empty(features, device=device, dtype=dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        weight = comfy.model_management.cast_to(self.scale, dtype=torch.float32, device=x.device) + 1.0
-        return F.rms_norm(x.float(), (x.shape[-1],), weight=weight, eps=self.eps).to(dtype)
+        weight = comfy.model_management.cast_to(self.scale, dtype=x.dtype, device=x.device) + 1.0
+        return F.rms_norm(x, (x.shape[-1],), weight=weight, eps=self.eps)
 
 
 class QKNorm(nn.Module):
@@ -78,9 +76,9 @@ class Attention(nn.Module):
         transformer_patches = transformer_options.get("patches", {})
         extra_options = transformer_options.copy()
         q, k, v, gate = self.wq(x), self.wk(x), self.wv(x), self.gate(x)
-        q = rearrange(q, "B L (H D) -> B H L D", H=self.heads)
-        k = rearrange(k, "B L (H D) -> B H L D", H=self.kvheads)
-        v = rearrange(v, "B L (H D) -> B H L D", H=self.kvheads)
+        q = q.unflatten(-1, (self.heads, -1)).transpose(1, 2)
+        k = k.unflatten(-1, (self.kvheads, -1)).transpose(1, 2)
+        v = v.unflatten(-1, (self.kvheads, -1)).transpose(1, 2)
         q, k = self.qknorm(q, k)
 
         if "block_index" in transformer_options and "attn1_patch" in transformer_patches:
@@ -91,13 +89,10 @@ class Attention(nn.Module):
 
         if freqs is not None:
             q, k = apply_rope(q, k, freqs)
-        if self.kvheads != self.heads:
-            rep = self.heads // self.kvheads
-            k = k.repeat_interleave(rep, dim=1)
-            v = v.repeat_interleave(rep, dim=1)
+        gqa_kwargs = {"enable_gqa": True} if self.kvheads != self.heads else {}
         q, k, v = AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v)
         out = optimized_attention_masked(q, k, v, self.heads, mask=mask, skip_reshape=True,
-                                         preferred_attention=self.comfy_attention, transformer_options=transformer_options)
+                                         preferred_attention=self.comfy_attention, transformer_options=transformer_options, **gqa_kwargs)
 
         if "block_index" in transformer_options and "attn1_output_patch" in transformer_patches:
             for p in transformer_patches["attn1_output_patch"]:
@@ -159,7 +154,7 @@ class TextFusionTransformer(nn.Module):
         x = x.reshape(b * l, n, d)
         for block in self.layerwise_blocks:
             x = block(x.contiguous(), mask=None, transformer_options=transformer_options)
-        x = rearrange(x, "(b l) n d -> b l d n", b=b, l=l)
+        x = x.unflatten(0, (b, l)).transpose(2, 3)
         x = self.projector(x).squeeze(-1)
         for block in self.refiner_blocks:
             x = block(x, mask=mask, transformer_options=transformer_options)
@@ -285,8 +280,9 @@ class SingleStreamDiT(nn.Module):
     def process_img(self, x, index=0):
         patch = self.patch
         x = comfy.ldm.common_dit.pad_to_patch_size(x, (patch, patch))
+        b, c = x.shape[:2]
         h, w = x.shape[-2] // patch, x.shape[-1] // patch
-        img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
+        img = x.reshape(b, c, h, patch, w, patch).permute(0, 2, 4, 1, 3, 5).reshape(b, h * w, c * patch * patch)
 
         img_ids = torch.zeros(h, w, 3, device=x.device, dtype=torch.float32)
         img_ids[..., 0] = index
@@ -374,8 +370,7 @@ class SingleStreamDiT(nn.Module):
         final = self.last(combined, t)
         del combined
         out = final[:, txtlen:txtlen + img_tokens, :]
-        out = rearrange(out, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
-                        h=h_, w=w_, ph=patch, pw=patch, c=self.channels)
+        out = out.reshape(bs, h_, w_, self.channels, patch, patch).permute(0, 3, 1, 4, 2, 5).reshape(bs, self.channels, h_ * patch, w_ * patch)
         out = out[:, :, :h_orig, :w_orig]  # crop padding back off
         if temporal:
             out = out.reshape(b5, t5, self.channels, h_orig, w_orig).movedim(1, 2)

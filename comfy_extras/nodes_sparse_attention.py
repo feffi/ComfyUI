@@ -12,6 +12,7 @@ import torch
 
 import comfy.model_management
 import comfy.model_prefetch
+import comfy.ops
 import comfy.patcher_extension
 from comfy.ldm.minimax.model import MiniMaxH3Model
 from comfy_api.latest import ComfyExtension, io
@@ -161,8 +162,8 @@ def _ineligible(q, k, v, dim_head):
         return f"dtype {q.dtype} (kernel takes bf16/fp16)"
     if dim_head != HEAD_DIM:
         return f"head_dim {dim_head} != {HEAD_DIM}"
-    if q.shape != k.shape or q.shape != v.shape:
-        return "cross-attention or GQA (kept dense)"
+    if q.shape[:2] != k.shape[:2] or q.shape[3] != k.shape[3] or k.shape != v.shape:
+        return "cross-attention (kept dense)"
     if k.dtype != q.dtype or v.dtype != q.dtype:
         return f"mixed dtypes {q.dtype}/{k.dtype}/{v.dtype}"
     return None
@@ -200,6 +201,7 @@ def make_attention_override(patch: SparseAttnPatch, previous):
         if reason is not None:
             patch.log_once(("ineligible", tuple(qs.shape), reason), f"dense {tuple(qs.shape)}: {reason}")
             return dense()
+        ks, vs = comfy.ops.repeat_kv_for_gqa(ks, vs, heads, 2)
         sink, sink_q = patch.sinks(transformer_options, tokens)
         if q.dtype == torch.float32:   # the kernel quantizes to int8 anyway; bf16 keeps the fp32 range
             qs, ks, vs = (t.to(torch.bfloat16) for t in (qs, ks, vs))
