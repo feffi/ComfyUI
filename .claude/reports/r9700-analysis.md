@@ -16,7 +16,7 @@ Target: Windows, Adrenalin 26.8.1, TheRock ROCm 10.0 wheels (HIP 7.15), torch 2.
 | 4 | MiniMax H3 VAE encode through the kitchen HIP conv | core | H3 | Removes a ~7.7 GB im2col buffer per 256 px × 17-frame tile and ~300k launches per 1024² keyframe. Kernel accumulates in fp32 (disassembly) | done: `85d2562`, `da79103`, `84cfd41` |
 | 5 | Replace SolAttn_triton with core **Model Sparse Attention** (method sol) | extension | H3 | SolAttn_triton is deprecated (26d816e is the deprecation commit), Triton JIT, NVIDIA-tested only; core node runs precompiled HIP `sol_attn`. Speed unmeasured | A/B, then remove |
 | 6 | Single-frame VAE convs as conv2d with MIOpen off; Qwen 2.1 decoder head in strips | core | Krea 2, Qwen 2.1, H3 bf16 | Removes ~8.7k (Krea 2) / ~68.6k (Qwen 2.1) bias-fill launches per 1024² decode; Qwen head scratch 2.5 GiB → 0.3 GiB at 1024². Output identical within 1e-6 | done: `ded5499`, `ff0e009` |
-| 7 | Krea 2 attention and norms | core | Krea 2 | Native GQA (no 4× K/V copies), no fp32 norm copies; GQA guard for fp32/no-flash. Fused modulation patch next (~3 %, est.) | done: `d0e865c`, `d7b3369`; patch A2-3 pending |
+| 7 | Krea 2 attention, norms and modulation | core | Krea 2 | Native GQA (no 4× K/V copies), no fp32 norm copies, GQA guard for fp32/no-flash, fused RMS AdaLN and RMS RoPE kernels (~3 % per step, est.) | done: `d0e865c`, `d7b3369`, `377a3f9` |
 | 8 | No bare `--fast`, no `--fast fp16_accumulation` | launch | Krea 2 | torch 2.13 ignores `allow_fp16_accumulation` on ROCm (verified in `CUDABlas.cpp`). The flag only moves Krea 2 to fp16, which has no clamp. No speed gain, NaN risk | **do now** |
 | 9 | One ComfyUI instance per card for Krea 2 / Qwen 2.1 | launch | Krea 2, Qwen 2.1 | Templates run cfg=1, so CFG Split leaves GPU 1 idle. Two queues ≈ 2× images/hour (est.) | try |
 | 10 | Startup: `--disable-partner-nodes`, Manager offline, `.pyc`/Defender | launch/system | all | −0.77 s measured (Linux CPU) for partner nodes; Manager pip probes cost 1–1.5 s on Linux, more on Windows (est.) | try |
@@ -56,47 +56,55 @@ Cherry-pick the branch commits (section 4) first. Without them, add `--cuda-devi
 main.py --cuda-device 0 --port 8188
 main.py --cuda-device 1 --port 8189 --database-url sqlite:///C:/<ComfyUI>/user/comfyui_gpu1.db
 ```
-Each instance may pin up to 40 % of RAM; with less than ~64 GB RAM add `--disable-pinned-memory` to the second one. Use **MultiGPU CFG Split** only for workflows with cfg > 1 (patch A3-4 improves its scheduling under DynamicVRAM).
+Each instance may pin up to 40 % of RAM; with less than ~64 GB RAM add `--disable-pinned-memory` to the second one. Use **MultiGPU CFG Split** only for workflows with cfg > 1 (`e9c38f9` fixes its batching under DynamicVRAM).
 
 **Do not** share a card with another GPU process during runs: HIP on Windows likely does not count other processes in free memory, so WDDM pages to RAM instead of raising OOM (unverified, `tools/A3/vram_probe.py` tests it).
 
 ## 4. Core changes
 
-### Already on the branch (verified by V1, CPU-tested)
+### On the branch (verified by V1, CPU-tested)
 
-Cherry-pick in this order onto your install (8cfe5e1e):
+All ten core proposals that survived verification are applied. Cherry-pick in this order onto your install (8cfe5e1e); the branch is based on e9027f2, so expect conflicts where your checkout differs:
 ```
-git cherry-pick d0e865c 85d2562 da79103 dd85c0c 52ed61a 2ed15ee 84cfd41 ff0e009 ded5499 d7b3369
+git cherry-pick d0e865c 85d2562 da79103 dd85c0c 52ed61a 2ed15ee 84cfd41 ff0e009 ded5499 d7b3369 377a3f9 e9c38f9 e997bcb 3781fb9
 ```
 
 | Commit | Change | CPU check |
 |---|---|---|
 | `d0e865c` | Krea 2: native GQA (`enable_gqa`), torch reshapes, RMSNorm without fp32 upcast; sparse override expands GQA itself | fp32 bit-identical; bf16 err vs fp32 6.0e-3 → 6.4e-3 |
 | `d7b3369` | SDPA wrapper checks native GQA support for unmasked calls too (fixes MATH fallback from `d0e865c` in fp32 / no-flash) | V1: expanded vs native bit-identical, ~1.2 µs/call |
+| `377a3f9` | Krea 2: `ck.rms_adaln` for norm+(1+scale)+shift, `addcmul` gated residuals, `ck.rms_rope` for QK-norm+RoPE; training and `attn1_patch` keep the unfused order | fp32 ≤ 2.5e-7 vs previous; bf16 err vs fp32 6.4–6.7e-3 → 6.0–6.4e-3 |
 | `85d2562`, `da79103` | MiniMax H3 VAE encoder: kitchen NDHWC fused norm/pad + HIP `fp16_conv3d`, default on RDNA3+ | fp16 paths equal error vs fp32 (1.49e-3); kernels use `v_wmma_f32_16x16x16_f16` |
 | `84cfd41` | MiniMax H3 single-frame encode uses the kitchen conv on HIP | 11/11 convs to kitchen, error unchanged |
 | `dd85c0c` | Qwen 2.1 text norm without fp32 upcast | fp32 identical, bf16 1.66e-3 → 1.85e-3 |
-| `52ed61a` | No forced single-GPU mode for ROCm on Windows | condition truth table |
-| `2ed15ee` | Select CLIP Device encodes with the retargeted model | repro 73/0 → 0/73 Linear calls |
 | `ff0e009` | Wan 2.2 / Qwen 2.1 decoder head in strips (single image) | bit-identical |
 | `ded5499` | Single-frame causal conv3d as conv2d with cuDNN off | ≤ 8.7e-7 fp32, bf16 identical |
+| `52ed61a` | No forced single-GPU mode for ROCm on Windows | condition truth table |
+| `2ed15ee` | Select CLIP Device encodes with the retargeted model | repro 73/0 → 0/73 Linear calls |
+| `e9c38f9` | MultiGPU CFG Split scheduler counts DynamicVRAM-evictable memory like the single-GPU path | identical to before without aimdo |
+| `e997bcb` | Bare `try/except: pass` around the AMD init block removed; AOTriton probe skipped when `--use-pytorch-cross-attention` is set | simulator: healthy start unchanged; missing arch and Ctrl+C now surface; probe 1× → 0× with the flag |
+| `3781fb9` | `_fp16_linear_wanted` checks dtype before the cuBLAS getter, removing a torch.compile graph break per `linear_input_act` | `fullgraph=True`: break before, single graph after (bf16 and fp16) |
 
-Known limits of these commits:
+### GPU checks still owed
+
+The kitchen HIP kernels and multi-GPU paths behind these commits never ran here. In order of risk:
+
+| Commit | Check on the R9700 | If it fails |
+|---|---|---|
+| `377a3f9` | `tools/A2/krea2_block_bench.py --device 1 --tokens 4608` with `--batch 1` and `--batch 2`: fused `rel_err` near the CPU numbers above, then image diff and s/it | `git revert 377a3f9` |
+| `da79103`, `84cfd41` | MiniMax H3 encode of a 17+ frame clip and of a single keyframe: time and peak VRAM against the previous build (`tools/A4/vae_bench.py --model minimax --op encode`) | revert both |
+| `2ed15ee`, `52ed61a` | H3 with Select CLIP Device → gpu:1: GPU 1 memory rises by the encoder size during encode, encode time drops (`tools/A3/run_placement_bench.py --model minimax --placement split`) | `--cuda-device all` as workaround for `52ed61a` |
+| `ded5499`, `ff0e009` | VAE decode at 1024² and 2048² for Krea 2 and Qwen 2.1: time and peak VRAM (`tools/A4/vae_bench.py`) | revert |
+| `e9c38f9` | CFG Split with cfg > 1 and batch 2: s/it (`run_placement_bench.py --cfg 4 --cfg-split`) | revert |
+| `e997bcb` | startup log on both cards still reports the expected attention line | revert |
+| `3781fb9` | only with TorchCompileModel (`tools/A5/ab_compile.py --variants baseline,torch_compile`) | none needed for eager runs |
+
+Known limits:
 - `da79103` relies on the HIP kernel accumulating in fp32. kitchen documents `fp16_conv3d` as fp16-accumulate, so this is fork-only under AGENTS.md. Re-check the disassembly when you bump comfy-kitchen.
 - The `da79103` gate (`amd_min_version(..., 3)`) also matches gfx1170/1171, which kitchen 0.2.36 does not ship kernels for. Irrelevant on your cards.
 - `--default-device` still does nothing on Windows ROCm (HIP on PAL ignores device order). Use `--cuda-device N`.
 - The Wan 2.1 VAE head (Krea 2) is not stripped; ~1.7 GB columns at 1024² bf16, within its estimate.
-
-### Ready patches (verified by V1, not applied)
-
-In `.claude/reports/r9700/patches/`, each applies to the current HEAD (`git apply --check` passed):
-
-| Patch | What | Gate before merging |
-|---|---|---|
-| `A2-3_krea2_fused_modulation.diff` (+20/−10) | Krea 2: `ck.rms_adaln` for norm+(1+scale)+shift, `addcmul` residuals, `ck.rms_rope` for QK-norm+RoPE (Qwen 2.1 pattern). Est. ~3 % per step, fewer launches | `tools/A2/krea2_block_bench.py --device 1 --tokens 4608` (batch 1 and 2): fused must match eager on gfx1201 (`rel_err`), then image diff + s/it |
-| `A3-4_multigpu_free_memory.diff` (1 line) | CFG Split scheduler counts DynamicVRAM-evictable memory like the single-GPU path | `run_placement_bench.py --cfg 4 --cfg-split`, batch 2 |
-| `A6-3_A7-4_amd_init.diff` | Remove the bare `try/except: pass` around the AMD init block (errors now surface instead of silently disabling SDPA/fp8); skip the AOTriton probe when `--use-pytorch-cross-attention` is set | startup log on both cards; Ctrl+C during startup |
-| `A5-3_fp16_linear_wanted_graph_break.diff` | Check dtype before the `allow_fp16_accumulation` getter; removes one torch.compile graph break per `linear_input_act` (Qwen 18→11, H3 40→32 breaks on CPU) | only matters with TorchCompileModel; `tools/A5/ab_compile.py --variants baseline,torch_compile` |
+- `torch._dynamo.explain` does not report the graph break `3781fb9` removes; use `fullgraph=True` to see it.
 
 ### Upstream items worth filing
 
@@ -152,7 +160,7 @@ Run against a separate instance (`--port 8199`), on GPU 1 when GPU 0 is busy. 3 
 | Attention backends per real shape (SDPA native/expanded, flash/efficient/math, kitchen int8, sol, VAE slice) | `tools/A1/attn_bench.py --device 1 --explain --profile` |
 | bf16 vs fp8 vs int8 linears, hipBLASLt vs rocBLAS, TunableOp | `tools/A2/gemm_bench.py --model <file> --tokens <n> --device 1` |
 | Top kernels per denoising step | `tools/A2/comfy_profile_step` (custom node; load via `extra_paths_profile.yaml` in the test instance only) |
-| Krea 2 fused modulation patch | `tools/A2/krea2_block_bench.py --device 1 --tokens 4608` |
+| Krea 2 fused kernels (`377a3f9`) | `tools/A2/krea2_block_bench.py --device 1 --tokens 4608` |
 | Model placement across cards, per-GPU peak VRAM, evictions | `tools/A3/run_placement_bench.py --model minimax\|krea2\|qi21 --placement single\|split` |
 | P2P, host bandwidth, free-memory visibility across processes, pinnable RAM | `tools/A3/vram_probe.py` |
 | VAE decode/encode with MIOpen off/on/FAST/immediate, cold vs warm find-db | `tools/A4/run_vae_matrix.py --gpu 1 --res 512` first (TDR risk), then 1024 |
@@ -173,8 +181,8 @@ Workflows: your saved workflows per model if present, else the official template
 
 - VAE SDPA on AMD (A1-4): ≤ 1–2 % of decode, the historic high-res crash is unexplained; needs GPU evidence first.
 - `PRIORITIZE_FP16 = is_nvidia()` (A2-4 core): unmeasured policy change for all AMD archs; not passing the flag is enough.
-- `model_prefetch.py` compile guards (part of A5-3): would silently disable the comfy compiler under TorchCompileModel.
-- `debug=True` in the AOTriton probe (part of A6-3): prints torch warnings on every RDNA2/3 startup.
+- `model_prefetch.py` compile guards (rest of A5-3): would silently disable the comfy compiler under TorchCompileModel.
+- `debug=True` in the AOTriton probe (rest of A6-3): prints torch warnings on every RDNA2/3 startup.
 - TorchCompileModel on H3: `float(sigma)` guard recompiles every step until the recompile limit.
 - Lazy imports for startup: AGENTS.md requires module-scope imports. Removing kitchen's `torch._dynamo` import: no gain, torchvision imports it anyway.
 - "10–60 min int8 loads" (kitchen#188): ComfyUI calls the `_dtype` dequant variants HIP does register; not supported on this stack.
