@@ -1,6 +1,6 @@
 # Measurement run: ComfyUI on 2× R9700 (Windows)
 
-Paste everything below the line into Claude Code on the R9700 machine, started in the directory that holds the production ComfyUI checkout. It measures what the static analysis in `.claude/reports/r9700-analysis.md` (branch `claude/cool-euler-0g3imw`) could only estimate, and returns a keep/revert verdict for each of the 14 branch commits.
+Paste everything below the line into Claude Code on the R9700 machine, started in the directory that holds the production ComfyUI checkout. It measures what the static analysis in `.claude/reports/r9700-analysis.md` (branch `claude/cool-euler-0g3imw`) could only estimate, and returns a keep/revert verdict for each of the 15 branch commits.
 
 ---
 
@@ -32,7 +32,7 @@ You are running a measurement session on a Windows machine with two AMD Radeon A
   git -C <PROD> fetch feffi claude/cool-euler-0g3imw
   git -C <PROD> worktree add <WT>\baseline 8cfe5e1e
   git -C <PROD> worktree add <WT>\patched 8cfe5e1e
-  git -C <WT>\patched cherry-pick d0e865c 85d2562 da79103 dd85c0c 52ed61a 2ed15ee 84cfd41 ff0e009 ded5499 d7b3369 377a3f9 e9c38f9 e997bcb 3781fb9
+  git -C <WT>\patched cherry-pick d0e865c 85d2562 da79103 dd85c0c 52ed61a 2ed15ee 84cfd41 ff0e009 ded5499 d7b3369 377a3f9 e9c38f9 e997bcb 3781fb9 91d15cb
   git -C <PROD> show feffi/claude/cool-euler-0g3imw:.claude/reports/r9700-analysis.md > <RESULTS>\analysis.md
   git -C <PROD> archive feffi/claude/cool-euler-0g3imw .claude/reports/r9700/tools | tar -x -C <RESULTS>
   ```
@@ -70,6 +70,7 @@ Per commit group, compare patched against baseline (and against the noise floor)
 | `85d2562`, `da79103`, `84cfd41` | MiniMax H3 VAE encode, 17+ frame clip and a single keyframe (`tools\A4\vae_bench.py --model minimax --op encode --gpu 1 --comfy <worktree>`, both worktrees) | latent rel diff vs baseline ≤ 2e-3, no NaN |
 | `ff0e009`, `ded5499` | VAE decode Krea 2 (Wan 2.1) and Qwen 2.1 at 1024² (`tools\A4\vae_bench.py --gpu 1 --comfy <worktree>`, both worktrees) | output rel diff ≤ 1e-5 in fp32, identical or near-identical in bf16 |
 | `dd85c0c` | Qwen-Image 2.1 workflow, same seed | within noise floor |
+| `91d15cb` (polyphase audio upsample) | MiniMax H3 audio decode of a 10 s clip, both worktrees; LTX audio if you use it | waveform rel diff ≤ 1e-5 (fp32), no NaN; decode time against baseline |
 | `2ed15ee`, `52ed61a` | MiniMax H3 with Select CLIP Device → gpu:1 (`tools\A3\run_placement_bench.py --model minimax --placement split`) | during encode GPU 1 peak rises by about the encoder size and GPU 0 does not load the encoder |
 | `e997bcb` | startup logs from phase 0 | same attention/fp8 state as baseline, or a clearer error |
 | all | `tools\A6\flat_output_check.py <output dir>` over every output | exit code 0 |
@@ -112,7 +113,7 @@ Each against the phase 2 patched result, same workflows:
 
 ## Phase 6: gaps the static analysis did not cover
 
-1. **MiniMax H3 audio VAE** (`comfy\ldm\minimax\audio_vae.py`: BigVGAN-style conv1d / transposed conv1d, anti-aliased resampling, Snake). Time audio encode and decode for a 10 s and a 60 s clip with MIOpen off vs on, and profile the top kernels. If the conv fallback dominates, describe the fix the same way as `ded5499` (no code changes in this run).
+1. **MiniMax H3 audio VAE** (`comfy\ldm\minimax\audio_vae.py`). `91d15cb` replaced the per-channel transposed-conv upsample (18,296 single-channel convs per decode with MIOpen off). Time audio encode and decode for a 10 s and a 60 s clip in both worktrees, MIOpen off vs on, and profile the top kernels. Expected remaining cost: 12,192 per-channel bias fills from the 42 dilated convs per decode (7,936 more per reference-audio encode). Report their share; describe a fix, do not change code in this run.
 2. **Text-encoder speed:** encode time per prompt for Qwen3-VL-4B (Krea 2), 8B (Qwen 2.1) and 32B int8_convrot (H3), on GPU 0 vs GPU 1, cold and warm.
 3. **Power and thermals:** if a local tool exposes GPU clock, power and temperature (look for `amd-smi` in the ROCm wheels or any vendor CLI already installed; install nothing), log them at 1 Hz during a 10-minute H3 run on both cards. Report whether clocks sag over time.
 4. **Coexistence:** does importing onnxruntime-directml or insightface in the same process change device enumeration, VRAM or startup time? Compare a test instance with and without the custom nodes that pull them in.
