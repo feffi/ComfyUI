@@ -104,14 +104,16 @@ class CausalConv3d(ops.Conv3d):
                 if front:
                     x = F.pad(x, (0, 0, 0, 0, front, 0), mode="constant")
 
-        if x.shape[2] == 1 and pad_t:
-            # single frame: the causal front padding is all zeros truncate the temporal taps instead of convolving zero frames
+        # single frame: the causal front padding is all zeros truncate the temporal taps instead of convolving zero frames
+        single = x.shape[2] == 1 and pad_t
+        if single and not (ndhwc and torch.version.hip is not None):
             out = super().forward(x, autopad="causal_zero")
         elif ndhwc:
             # cast_bias_weight handles offloaded layers; channels_last keeps cuDNN's output NDHWC
             weight, bias, offload_stream = comfy.ops.cast_bias_weight(self, x, offloadable=True)
             try:
-                weight_cl = weight.contiguous(memory_format=torch.channels_last_3d)
+                # on HIP the single frame goes to the kitchen conv as well, with only the last temporal tap
+                weight_cl = (weight[:, :, -1:] if single else weight).contiguous(memory_format=torch.channels_last_3d)
                 out = _fp16_accum_conv(self, x, weight_cl, bias, residual)
                 if out is not None:
                     return out
