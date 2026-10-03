@@ -1,0 +1,5 @@
+# Loads the A2 profiling node into a test instance only:
+#   python main.py --port 8199 --cuda-device 1 --extra-model-paths-config <path>\extra_paths_profile.yaml
+# Set custom_nodes to the folder that CONTAINS comfy_profile_step (this deliverables folder).
+a2_profile:
+  custom_nodes: C:\path\to\deliverables\A2

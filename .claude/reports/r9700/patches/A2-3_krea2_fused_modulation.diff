@@ -1,0 +1,75 @@
+diff --git a/comfy/ldm/krea2/model.py b/comfy/ldm/krea2/model.py
+index 6942982..b867d45 100644
+--- a/comfy/ldm/krea2/model.py
++++ b/comfy/ldm/krea2/model.py
+@@ -12,6 +12,7 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ 
+ import comfy.model_management
++import comfy.quant_ops
+ import comfy.patcher_extension
+ import comfy.ldm.common_dit
+ import comfy.utils
+@@ -32,6 +33,13 @@ class RMSNorm(nn.Module):
+         weight = comfy.model_management.cast_to(self.scale, dtype=x.dtype, device=x.device) + 1.0
+         return F.rms_norm(x, (x.shape[-1],), weight=weight, eps=self.eps)
+ 
++    def modulate(self, x, scale, shift):
++        if comfy.model_management.in_training:
++            return (1 + scale) * self(x) + shift
++        # (1 + w) * (1 + scale) folded into rms_adaln's (1 + scale)
++        w = comfy.model_management.cast_to(self.scale, dtype=x.dtype, device=x.device)
++        return comfy.quant_ops.ck.rms_adaln(x, torch.addcmul(w + scale, w, scale), shift, self.eps)
++
+ 
+ class QKNorm(nn.Module):
+     def __init__(self, dim: int, device=None, dtype=None, operations=None):
+@@ -79,16 +87,19 @@ class Attention(nn.Module):
+         q = q.unflatten(-1, (self.heads, -1)).transpose(1, 2)
+         k = k.unflatten(-1, (self.kvheads, -1)).transpose(1, 2)
+         v = v.unflatten(-1, (self.kvheads, -1)).transpose(1, 2)
+-        q, k = self.qknorm(q, k)
+-
+-        if "block_index" in transformer_options and "attn1_patch" in transformer_patches:
+-            for p in transformer_patches["attn1_patch"]:
++        patches = transformer_patches.get("attn1_patch", []) if "block_index" in transformer_options else []
++        if freqs is not None and not patches and not comfy.model_management.in_training:
++            qw = comfy.model_management.cast_to(self.qknorm.qnorm.scale, dtype=q.dtype, device=q.device) + 1.0
++            kw = comfy.model_management.cast_to(self.qknorm.knorm.scale, dtype=k.dtype, device=k.device) + 1.0
++            q, k = comfy.quant_ops.ck.rms_rope(q, k, freqs, qw, kw, self.qknorm.qnorm.eps)
++        else:
++            q, k = self.qknorm(q, k)
++            for p in patches:
+                 out = p(q, k, v, pe=freqs, attn_mask=mask, extra_options=extra_options)
+                 q, k, v = out.get("q", q), out.get("k", k), out.get("v", v)
+                 freqs, mask = out.get("pe", freqs), out.get("attn_mask", mask)
+-
+-        if freqs is not None:
+-            q, k = apply_rope(q, k, freqs)
++            if freqs is not None:
++                q, k = apply_rope(q, k, freqs)
+         gqa_kwargs = {"enable_gqa": True} if self.kvheads != self.heads else {}
+         q, k, v = AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v)
+         out = optimized_attention_masked(q, k, v, self.heads, mask=mask, skip_reshape=True,
+@@ -208,9 +219,8 @@ class SingleStreamBlock(nn.Module):
+             del mlp
+             return x
+ 
+-        x = x + pregate * self.attn((1 + prescale) * self.prenorm(x) + preshift, freqs, mask, transformer_options=transformer_options)
+-        x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
+-        return x
++        x = torch.addcmul(x, pregate, self.attn(self.prenorm.modulate(x, prescale, preshift), freqs, mask, transformer_options=transformer_options))
++        return torch.addcmul(x, postgate, self.mlp(self.postnorm.modulate(x, postscale, postshift)))
+ 
+ 
+ class LastLayer(nn.Module):
+@@ -222,8 +232,7 @@ class LastLayer(nn.Module):
+ 
+     def forward(self, x, tvec):
+         scale, shift = self.modulation(tvec)
+-        x = (1 + scale) * self.norm(x) + shift
+-        return self.linear(x)
++        return self.linear(self.norm.modulate(x, scale, shift))
+ 
+ 
+ class SingleStreamDiT(nn.Module):
