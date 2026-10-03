@@ -629,8 +629,11 @@ class Decoder3d(nn.Module):
                 x = layer(x, first_chunk=first_chunk)
 
         ## head
+        if feat_cache is None:
+            # single image: the full resolution head conv runs in strips like the blocks above
+            return strip_apply(self.head, x)
         for layer in self.head:
-            if isinstance(layer, CausalConv3d) and feat_cache is not None:
+            if isinstance(layer, CausalConv3d):
                 idx = feat_idx[0]
                 cache_x = x[:, :, -CACHE_T:, :, :].clone()
                 if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
