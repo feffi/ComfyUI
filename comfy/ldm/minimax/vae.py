@@ -40,9 +40,10 @@ LATENTS_STD = [
 
 def _kitchen_ndhwc(x):
     # NDHWC when the kitchen pad kernel can feed it and the conv consumes it natively:
-    # cuDNN does, MIOpen converts back and loses more than the fused pad saves
+    # cuDNN does; on ROCm only the kitchen fp16 conv does, torch's conv converts back and loses more than the fused pad saves
     ck = getattr(comfy.quant_ops, "ck", None)
-    return (ck is not None and hasattr(ck, "group_norm_silu_pad3d") and torch.version.hip is None
+    return (ck is not None and hasattr(ck, "group_norm_silu_pad3d")
+            and (torch.version.hip is None or comfy.ops._fp16_linear_wanted(x))
             and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16))
 
 
