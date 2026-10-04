@@ -1,6 +1,6 @@
 # ComfyUI on 2× Radeon AI PRO R9700: analysis report
 
-Stand: 03.10.2026. Branch `claude/cool-euler-0g3imw`. Produced by the prompt in `.claude/prompts/amd-r9700-analysis.md`: 8 analysis agents, 2 verifiers (code and claims), synthesis.
+Stand: 04.10.2026. Branch `claude/cool-euler-0g3imw`. Produced by the prompt in `.claude/prompts/amd-r9700-analysis.md`: 8 analysis agents, 2 verifiers (code and claims), synthesis.
 
 **Read this first.** All analysis ran in a Linux cloud container without a GPU. Nothing here was timed on an R9700. "Measured" means measured in that container: CPU numerics, CPU import timing, disassembly of the comfy-kitchen gfx1201 code objects, and PyTorch/HIP source reads. Every GPU speed or VRAM effect is an estimate until you run the tools in `.claude/reports/r9700/tools/`.
 
@@ -103,6 +103,19 @@ git cherry-pick b09048c 37b7bce   # regression tests only, no runtime change
 
 The equivalence tests (round trip, fused vs unfused, upsample vs transposed conv) also pass on the old code; they guard later changes, not the original bugs. Not covered: `e9c38f9` (needs two devices), `e997bcb` (runs at `model_management` import), the sparse attention part of `d0e865c` (rejects non-CUDA tensors first; phase 1b of the measurement prompt checks it on the R9700), and the fork-only HIP commits `85d2562`, `da79103`, `84cfd41`. The measurement prompt (phase 1a) runs the tests on the R9700 against both builds; the baseline run is the on-hardware evidence for `d7b3369`.
 
+### comfy-kitchen patches (fp8 GEMM)
+
+The local session adopted the branch on 04.10.2026 (Krea 2 at 1280x2048, cfg 1.8: 183 s -> 77 s warm, together with fp8_e4m3fn_fast weights, SageAttention-RDNA4 and a res_2m refine) and measured kitchen's fp8 GEMM against hipBLASLt: 10-20 % slower for K <= 6144, 35-42 % faster for K = 16384, 47.0 ms per Krea 2 block vs 49.9 (hipBLASLt untuned) and 40.9 (TunableOp), and 5x slower at M ~ 2 (0.55 vs 0.11 ms). Four patches against kitchen v0.2.36 (`888b13e`, they also apply to v0.2.37) answer that. Nothing was timed here; details in `.claude/reports/kitchen-r9700.md`, patches, benchmark and Windows build steps in `.claude/kitchen-r9700/`.
+
+| Patch | Change | Output | Expected |
+|---|---|---|---|
+| 0001 | WMMA GEMM core: tile loads without exec-masked branches and coalesced to whole 128-byte lines; the K-tail test only in kernels whose K is not a multiple of BKB | bit-identical | per K tile and wave 45 VALU, 42 SALU, 11 branches -> 24, 8, 3; a few % at large M; shared by the int8, int4 and fp16 GEMMs |
+| 0002 | fp8 GEMV (M <= 8): `v_cvt_pk_f32_fp8` decode instead of ~650 VALU per 16 bytes, all rows per wave so the weight is read once | bit-identical | M ~ 2, K 4096, N 16384: 0.55 ms -> towards the 0.10 ms bandwidth floor |
+| 0003 | six more tiles (64x64 wave tiles: a third fewer LDS reads per MMA; 16/32-row tiles for small M) and a measured tile choice per shape class instead of fixed thresholds | bit-identical | 0 to ~15 % at K <= 6144; first GEMM per class pays ~0.2-0.4 s of tuning; `COMFY_KITCHEN_HIP_FP8_TUNE=0` restores 0.2.36 |
+| 0004 | draft: hardware e4m3 encode (`v_cvt_pk_fp8_f32`) in the per-tensor quantize | **unverified** | quantize from VALU-bound towards memory-bound |
+
+0001-0003 feed every output the same WMMA K-steps in the same order. A CPU emulation running kitchen's kernel source confirms it: 17 cases (GEMV, every tile path, K tails, partial tiles, three output dtypes, bias), 0 differing bytes against v0.2.36 for 0001, 0002, each of the 11 tiles forced and the tuned default. 0004 ships with `check_fp8_quantize.py` (every bf16 and fp16 pattern, every e4m3 midpoint) and stays out if one byte differs.
+
 ### GPU checks still owed
 
 The kitchen HIP kernels and multi-GPU paths behind these commits never ran here. In order of risk:
@@ -118,6 +131,8 @@ The kitchen HIP kernels and multi-GPU paths behind these commits never ran here.
 | `e9c38f9` | CFG Split with cfg > 1 and batch 2: s/it (`run_placement_bench.py --cfg 4 --cfg-split`) | revert |
 | `e997bcb` | startup log on both cards still reports the expected attention line | revert |
 | `3781fb9` | only with TorchCompileModel (`tools/A5/ab_compile.py --variants baseline,torch_compile`) | none needed for eager runs |
+| kitchen 0001-0003 | `.claude/kitchen-r9700/bench_fp8_gemm.py --ref` against the installed 0.2.36: `identical` on every shape, then ms per shape and the Krea 2 block total against 47.0 / 40.9 ms; `--sweep-tiles` to see the tuner's choices | drop the patch; for 0003 alone `COMFY_KITCHEN_HIP_FP8_TUNE=0` |
+| kitchen 0004 | `.claude/kitchen-r9700/check_fp8_quantize.py --ref`: 0 differing bytes | leave 0004 out |
 
 Known limits:
 - `da79103` relies on the HIP kernel accumulating in fp32. kitchen documents `fp16_conv3d` as fp16-accumulate, so this is fork-only under AGENTS.md. Re-check the disassembly when you bump comfy-kitchen.
@@ -130,7 +145,7 @@ Known limits:
 
 ### Upstream items worth filing
 
-- comfy-kitchen: document per-backend accumulation (HIP fp16 conv/GEMM accumulate in fp32), bf16 HIP conv3d (would move Krea 2 / Qwen VAEs off torch's fallback), `sol_attn` with Lq≠Lk and native GQA (Qwen 2.1 sparse), hardware fp8 convert in the HIP quantize kernel (`v_cvt_pk_fp8_f32`), kitchen#184 (HIP sol paired query blocks, +18–20 % on gfx1201).
+- comfy-kitchen: the four patches above, once measured on the R9700. Still open: document per-backend accumulation (proposed text in `kitchen-r9700.md`: HIP fp16 conv/GEMM accumulate in fp32), bf16 HIP conv3d (would move Krea 2 / Qwen VAEs off torch's fallback), `sol_attn` with Lq≠Lk and native GQA (Qwen 2.1 sparse), kitchen#184 (HIP sol paired query blocks, +18–20 % on gfx1201; moot while Sage handles attention).
 - PyTorch: `slow_conv_dilated` writes bias with one kernel per output channel and builds columns for 1×1 (`NaiveDilatedConvolution.cu`); port the `slow_conv2d` behaviour. Covers multi-frame video VAE decode, which `ded5499` does not. Grouped convs on the slow backends (`SlowTranspose2d`, `Slow2d`, `SlowDilated*`) run one conv per group (`Convolution.cpp` group loop); `91d15cb` avoids it for the audio upsample only.
 - ROCm: HIP on PAL ignores `HIP_VISIBLE_DEVICES` order; AOTriton 0.14 gfx1201 kernels landed in release/2.13 after the 10.0.0 wheels.
 
