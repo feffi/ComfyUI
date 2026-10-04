@@ -1,0 +1,141 @@
+From bde056d1a0ef3ddd4adf7e4850e190e9742ad143 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 4 Oct 2026 20:00:37 +0000
+Subject: [PATCH 2/4] [Perf][HIP] Small-M fp8 GEMV: hardware fp8 decode, one
+ pass over B
+
+At M <= 8 the fp8 GEMV ran one wave per (row, column) and decoded every
+operand byte in software: about 650 VALU instructions and 32 exec-masked
+branches per 16-byte chunk, so it was VALU-bound and re-read the weight once
+per row. Decode with v_cvt_pk_f32_fp8 on gfx12 and let each wave cover all
+M rows of its column, so B is read and decoded once.
+
+Each output keeps the same serial FMA chain in byte order and the same wave
+reduction, and the hardware fp8 to f32 conversion is exact, so results are
+unchanged. gfx11 keeps the software decode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014FGDV3n1PG2QWogzESLcaZ
+---
+ comfy_kitchen/backends/hip/fp8_utils.h      | 24 +++++++++++++
+ comfy_kitchen/backends/hip/ops/gemm_fp8.hip | 39 ++++++++++++---------
+ 2 files changed, 47 insertions(+), 16 deletions(-)
+
+diff --git a/comfy_kitchen/backends/hip/fp8_utils.h b/comfy_kitchen/backends/hip/fp8_utils.h
+index fd03ebb..bd86c33 100644
+--- a/comfy_kitchen/backends/hip/fp8_utils.h
++++ b/comfy_kitchen/backends/hip/fp8_utils.h
+@@ -12,6 +12,8 @@
+ #include <cmath>
+ #include <cstdint>
+ 
++#include "architecture_config.h"
++
+ namespace comfy::hip_backend {
+ 
+ // dtype codes match comfy_kitchen.backends.eager.quantization.DTYPE_TO_CODE
+@@ -183,6 +185,28 @@ __forceinline__ __device__ float fp8_to_float(uint8_t b) {
+     return sign * __uint_as_float(bits);
+ }
+ 
++// Sixteen e4m3fn bytes, as loaded by one 16-byte read, to floats in byte order.
++// gfx12 converts in hardware, two bytes per v_cvt_pk_f32_fp8; the conversion is
++// exact, so it agrees with fp8_to_float on every code, NaN included.
++__forceinline__ __device__ void fp8x16_to_float(uint4 v, float (&f)[16]) {
++#if defined(COMFY_MMA_GFX12)
++    const uint32_t w[4] = {v.x, v.y, v.z, v.w};
++    #pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        const auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(static_cast<int>(w[j]), false);
++        const auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(static_cast<int>(w[j]), true);
++        f[4 * j] = lo[0];
++        f[4 * j + 1] = lo[1];
++        f[4 * j + 2] = hi[0];
++        f[4 * j + 3] = hi[1];
++    }
++#else
++    const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
++    #pragma unroll
++    for (int i = 0; i < 16; ++i) f[i] = fp8_to_float(b[i]);
++#endif
++}
++
+ // e5m2 counterpart. Unlike e4m3fn it follows IEEE: an all-ones exponent is an
+ // infinity when the mantissa is zero and a NaN otherwise.
+ __forceinline__ __device__ float bf8_to_float(uint8_t b) {
+diff --git a/comfy_kitchen/backends/hip/ops/gemm_fp8.hip b/comfy_kitchen/backends/hip/ops/gemm_fp8.hip
+index d44a284..44fcbf2 100644
+--- a/comfy_kitchen/backends/hip/ops/gemm_fp8.hip
++++ b/comfy_kitchen/backends/hip/ops/gemm_fp8.hip
+@@ -14,45 +14,52 @@
+ namespace comfy::hip_backend {
+ 
+ // Small-M path. A 16-row WMMA tile is mostly idle at small M, so reduce K
+-// across the wave instead: one wave per output column.
++// across the wave instead: one wave per output column, covering all M rows so
++// each 16-byte chunk of B is read and decoded once.
++constexpr int kGemvMaxM = 8;
++
+ template <typename OutT>
+ __global__ __launch_bounds__(256) void gemv_fp8_kernel(
+     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
+     int M, int N, int K, EpiTensorwise epi) {
+ 
+     const int col = blockIdx.x * blockDim.y + threadIdx.y;
+-    const int row = blockIdx.y;
+-    if (col >= N || row >= M) return;
++    if (col >= N) return;
+ 
+-    const uint8_t* a = A + static_cast<int64_t>(row) * K;
+     const uint8_t* b = B + static_cast<int64_t>(col) * K;
+ 
+     // Bandwidth-bound on streaming B: 16 bytes per lane is a 512-byte wave
+     // transaction.
+-    float sum = 0.0f;
++    float sum[kGemvMaxM] = {};
+     for (int k = threadIdx.x * 16; k < K; k += kWave * 16) {
+         // K is a multiple of 16, so a 16-byte chunk never straddles the end.
+-        const uint4 av = *reinterpret_cast<const uint4*>(a + k);
+-        const uint4 bv = *reinterpret_cast<const uint4*>(b + k);
+-        const uint8_t* ab = reinterpret_cast<const uint8_t*>(&av);
+-        const uint8_t* bb = reinterpret_cast<const uint8_t*>(&bv);
++        float bf[16];
++        fp8x16_to_float(*reinterpret_cast<const uint4*>(b + k), bf);
+         #pragma unroll
+-        for (int i = 0; i < 16; ++i) sum += fp8_to_float(ab[i]) * fp8_to_float(bb[i]);
++        for (int r = 0; r < kGemvMaxM; ++r) {
++            if (r >= M) break;
++            float af[16];
++            fp8x16_to_float(*reinterpret_cast<const uint4*>(A + static_cast<int64_t>(r) * K + k), af);
++            #pragma unroll
++            for (int i = 0; i < 16; ++i) sum[r] += af[i] * bf[i];
++        }
+     }
+-    sum = wave_reduce_sum(sum);
+ 
+-    if (threadIdx.x == 0) {
+-        epi.init();
+-        C[static_cast<int64_t>(row) * N + col] = static_cast<OutT>(epi(row, col, sum));
++    epi.init();
++    #pragma unroll
++    for (int r = 0; r < kGemvMaxM; ++r) {
++        if (r >= M) break;
++        const float s = wave_reduce_sum(sum[r]);
++        if (threadIdx.x == 0) C[static_cast<int64_t>(r) * N + col] = static_cast<OutT>(epi(r, col, s));
+     }
+ }
+ 
+ template <typename OutT>
+ static void launch_fp8(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int K,
+                        EpiTensorwise epi, hipStream_t stream) {
+-    if (M <= 8) {
++    if (M <= kGemvMaxM) {
+         dim3 block(kWave, 8);
+-        dim3 grid((N + 7) / 8, M);
++        dim3 grid((N + 7) / 8);
+         gemv_fp8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, epi);
+         return;
+     }
+-- 
+2.43.0
+

@@ -1,0 +1,205 @@
+From 068eb937d08ad4b4421537f22b374cdbca590d9a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 4 Oct 2026 19:54:07 +0000
+Subject: [PATCH 1/4] [Perf][HIP] Branch-free, coalesced tile loads in the WMMA
+ GEMM core
+
+TileStager zero-filled out-of-range rows and the K tail with a per-chunk
+test, which the compiler lowers to an exec-masked branch per 16-byte load:
+per K tile of the 128x128x128 fp8 kernel 45 VALU, 42 SALU and 11 branches
+around 64 WMMAs. Rows past the edge now load the last valid row, which only
+reaches output rows and columns the writeback already skips, and the K test
+is kept only in kernels launched with a K that is not a multiple of BKB.
+Chunks are assigned round-robin so a wave load covers whole 128-byte lines.
+
+Output is unchanged: every output element sees the same WMMA sequence.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014FGDV3n1PG2QWogzESLcaZ
+---
+ comfy_kitchen/backends/hip/gemm_wmma.h | 88 ++++++++++++++++----------
+ 1 file changed, 55 insertions(+), 33 deletions(-)
+
+diff --git a/comfy_kitchen/backends/hip/gemm_wmma.h b/comfy_kitchen/backends/hip/gemm_wmma.h
+index 7944233..ab147dc 100644
+--- a/comfy_kitchen/backends/hip/gemm_wmma.h
++++ b/comfy_kitchen/backends/hip/gemm_wmma.h
+@@ -34,7 +34,18 @@ constexpr int kLdsPad = 8;
+ //
+ // kbytes is the source row length in bytes (K for 8-bit types, K/2 for int4) and
+ // is a multiple of 16, so a 16-byte chunk starting inside a row also ends inside
+-// it. Out-of-range rows and the K tail are zero-filled.
++// it. The K tail is zero-filled.
++//
++// Chunk c is row c / kChunksPerRow, bytes (c % kChunksPerRow) * 16, and a thread
++// takes chunks tid, tid + THREADS, ...: consecutive lanes read consecutive 16
++// bytes, so a wave load covers whole 128-byte lines rather than 32 bytes of each
++// of 16 rows.
++//
++// Rows past rows_total load the last row instead of zeros. Row r of A reaches
++// only row r of the result and row c of B only column c, and every writeback
++// skips both, so the copies are never observed and the loads stay unconditional.
++// The K tail cannot be clamped away; kTail is set only for the tile that crosses
++// kbytes, so full tiles skip the per-chunk test.
+ template <int ROWS, int BKB, int THREADS>
+ struct TileStager {
+     static constexpr int kChunksPerRow = BKB / 16;
+@@ -48,16 +59,17 @@ struct TileStager {
+ 
+     uint4 regs[kPerThread];
+ 
++    template <bool kTail = true>
+     __forceinline__ __device__ void load(const uint8_t* __restrict__ src, int row0, int rows_total,
+                                          int kbyte0, int kbytes) {
+         const int tid = threadIdx.x;
+         #pragma unroll
+         for (int i = 0; i < kPerThread; ++i) {
+-            const int c = tid * kPerThread + i;
+-            const int grow = row0 + c / kChunksPerRow;
++            const int c = i * THREADS + tid;
++            const int grow = min(row0 + c / kChunksPerRow, rows_total - 1);
+             const int gk = kbyte0 + (c % kChunksPerRow) * 16;
+ 
+-            regs[i] = (grow < rows_total && gk < kbytes)
++            regs[i] = (!kTail || gk < kbytes)
+                           ? *reinterpret_cast<const uint4*>(
+                                 src + static_cast<int64_t>(grow) * kbytes + gk)
+                           : make_uint4(0, 0, 0, 0);
+@@ -66,18 +78,17 @@ struct TileStager {
+ 
+     // Same, for an operand whose rows are gathered rather than stored contiguously:
+     // Src::chunk(row, kbyte) returns those 16 bytes, and neither is out of range.
+-    template <typename Src>
++    template <bool kTail = true, typename Src>
+     __forceinline__ __device__ void load(const Src& src, int row0, int rows_total, int kbyte0,
+                                          int kbytes) {
+         const int tid = threadIdx.x;
+         #pragma unroll
+         for (int i = 0; i < kPerThread; ++i) {
+-            const int c = tid * kPerThread + i;
+-            const int grow = row0 + c / kChunksPerRow;
++            const int c = i * THREADS + tid;
++            const int grow = min(row0 + c / kChunksPerRow, rows_total - 1);
+             const int gk = kbyte0 + (c % kChunksPerRow) * 16;
+ 
+-            regs[i] = (grow < rows_total && gk < kbytes) ? src.chunk(grow, gk)
+-                                                         : make_uint4(0, 0, 0, 0);
++            regs[i] = (!kTail || gk < kbytes) ? src.chunk(grow, gk) : make_uint4(0, 0, 0, 0);
+         }
+     }
+ 
+@@ -85,7 +96,7 @@ struct TileStager {
+         const int tid = threadIdx.x;
+         #pragma unroll
+         for (int i = 0; i < kPerThread; ++i) {
+-            const int c = tid * kPerThread + i;
++            const int c = i * THREADS + tid;
+             uint8_t* dst = lds + (c / kChunksPerRow) * kStride + (c % kChunksPerRow) * 16;
+             // 8-byte stores: kLdsPad breaks 16-byte LDS alignment.
+             *reinterpret_cast<uint2*>(dst) = make_uint2(regs[i].x, regs[i].y);
+@@ -106,9 +117,11 @@ struct GemmOperandA<const uint8_t*> {
+ };
+ 
+ // Epi is a functor: float operator()(int row, int col, float acc) const.
++// KTAIL is set when kbytes is not a multiple of BKB, so only those launches carry
++// the per-chunk K test in their loads.
+ template <typename Mma, typename Epi, typename OutT,
+           int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN,
+-          typename ASrc = const uint8_t*>
++          typename ASrc = const uint8_t*, bool KTAIL = true>
+ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
+     typename GemmOperandA<ASrc>::type A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
+     int M, int N, int kbytes, int ldc, Epi epi) {
+@@ -167,8 +180,8 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
+     TileStager<BM, BKB, kThreads> sa;
+     TileStager<BN, BKB, kThreads> sb;
+ 
+-    sa.load(A, m0, M, 0, kbytes);
+-    sb.load(B, n0, N, 0, kbytes);
++    sa.template load<KTAIL>(A, m0, M, 0, kbytes);
++    sb.template load<KTAIL>(B, n0, N, 0, kbytes);
+     sa.store(As);
+     sb.store(Bs);
+     __syncthreads();
+@@ -179,8 +192,8 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
+ 
+         // Prefetch the next tile's global reads ahead of the current tile's math.
+         if (has_next) {
+-            sa.load(A, m0, M, knext, kbytes);
+-            sb.load(B, n0, N, knext, kbytes);
++            sa.template load<KTAIL>(A, m0, M, knext, kbytes);
++            sb.template load<KTAIL>(B, n0, N, knext, kbytes);
+         }
+ 
+         // Register-level pipeline over K-steps: the LDS reads for step kk+1 are
+@@ -275,6 +288,23 @@ inline int device_wgp_count() {
+     return n;
+ }
+ 
++// One tile configuration over the whole grid. A K that is a multiple of BKB
++// launches the instantiation whose loads have no K test.
++template <typename Mma, typename Epi, typename OutT, int BM, int BN, int BKB, int WARPS_M,
++          int WARPS_N, int TM, int TN, typename ASrc>
++void launch_gemm_tile(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbytes, int ldc,
++                      Epi epi, hipStream_t stream) {
++    const dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
++    constexpr int kThreads = WARPS_M * WARPS_N * kWave;
++    if (kbytes % BKB == 0) {
++        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, WARPS_M, WARPS_N, TM, TN, ASrc, false>
++            <<<grid, kThreads, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
++    } else {
++        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, WARPS_M, WARPS_N, TM, TN, ASrc, true>
++            <<<grid, kThreads, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
++    }
++}
++
+ // Pick and launch a tile for C[M, N] = A[M, K] @ B[N, K]^T, selecting on grid
+ // coverage, K depth and warp grid. 128x128 has the best arithmetic intensity but
+ // wastes the device when it yields fewer blocks than there are WGPs; BKB=128
+@@ -295,33 +325,25 @@ void launch_gemm_wmma(ASrc A, const uint8_t* B, OutT* C, int M, int N, int kbyte
+ 
+     if (!skinny && blocks_128 >= wgps) {
+         if (kbytes >= 4096) {
+-            constexpr int BM = 128, BN = 128, BKB = 128;
+-            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+             // With few blocks per WGP there is nothing to interleave across, so
+             // the 16-wave grid hides latency within a block instead.
+             if (blocks_128 <= 4 * wgps) {
+-                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 4, 2, 2, ASrc>
+-                    <<<grid, 512, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
++                launch_gemm_tile<Mma, Epi, OutT, 128, 128, 128, 4, 4, 2, 2>(
++                    A, B, C, M, N, kbytes, ldc, epi, stream);
+             } else {
+-                gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
+-                    <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
++                launch_gemm_tile<Mma, Epi, OutT, 128, 128, 128, 4, 2, 2, 4>(
++                    A, B, C, M, N, kbytes, ldc, epi, stream);
+             }
+         } else {
+-            constexpr int BM = 128, BN = 128, BKB = 64;
+-            dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+-            gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 4, 2, 2, 4, ASrc>
+-                <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
++            launch_gemm_tile<Mma, Epi, OutT, 128, 128, 64, 4, 2, 2, 4>(
++                A, B, C, M, N, kbytes, ldc, epi, stream);
+         }
+     } else if (kbytes >= 2048) {
+-        constexpr int BM = 64, BN = 64, BKB = 128;
+-        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+-        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
+-            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
++        launch_gemm_tile<Mma, Epi, OutT, 64, 64, 128, 2, 2, 2, 2>(
++            A, B, C, M, N, kbytes, ldc, epi, stream);
+     } else {
+-        constexpr int BM = 64, BN = 64, BKB = 64;
+-        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+-        gemm_wmma_kernel<Mma, Epi, OutT, BM, BN, BKB, 2, 2, 2, 2, ASrc>
+-            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, ldc, epi);
++        launch_gemm_tile<Mma, Epi, OutT, 64, 64, 64, 2, 2, 2, 2>(
++            A, B, C, M, N, kbytes, ldc, epi, stream);
+     }
+ }
+ 
+-- 
+2.43.0
+

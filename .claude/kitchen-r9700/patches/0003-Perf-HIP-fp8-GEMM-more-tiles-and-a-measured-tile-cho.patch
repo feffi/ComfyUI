@@ -1,0 +1,245 @@
+From 048b1723afdcd76c8d97a7f8a2230226e447a160 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 4 Oct 2026 20:15:46 +0000
+Subject: [PATCH 3/4] [Perf][HIP] fp8 GEMM: more tiles and a measured tile
+ choice per shape
+
+The fp8 GEMM picked one of five tiles with K and grid-size thresholds tuned
+once on RDNA4. Add 256x128 and 128x256 tiles with 64x64 wave tiles (a third
+fewer LDS fragment reads per MMA), a 16-wave 256x128, a 4-wave 128x128 and
+16/32-row tiles for small M, and choose among all eleven by timing: the
+first GEMM of a shape class (device, M in quarter octaves, N, K, output
+dtype, bias) runs each eligible tile on the caller's stream and keeps the
+fastest for the process. Stream capture, a K no tile divides and
+COMFY_KITCHEN_HIP_FP8_TUNE=0 keep the previous heuristic;
+COMFY_KITCHEN_HIP_FP8_TILE forces a tile for benchmarks.
+
+Every tile feeds each output the same WMMA K-steps in the same order, so
+the choice never changes results.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014FGDV3n1PG2QWogzESLcaZ
+---
+ comfy_kitchen/backends/hip/ops/gemm_fp8.hip | 180 +++++++++++++++++++-
+ 1 file changed, 176 insertions(+), 4 deletions(-)
+
+diff --git a/comfy_kitchen/backends/hip/ops/gemm_fp8.hip b/comfy_kitchen/backends/hip/ops/gemm_fp8.hip
+index 44fcbf2..49f4a3a 100644
+--- a/comfy_kitchen/backends/hip/ops/gemm_fp8.hip
++++ b/comfy_kitchen/backends/hip/ops/gemm_fp8.hip
+@@ -4,8 +4,13 @@
+ // FP8 scaled GEMM on WMMA (v_wmma_f32_16x16x16_fp8_fp8 on gfx12; gfx11 has no
+ // fp8 WMMA and widens the operands to bf16). See mma.h.
+ // C[M, N] = (A[M, K] @ B[N, K]^T) * scale_a * scale_b + bias
++#include <cstdio>
++#include <cstdlib>
++#include <limits>
++#include <mutex>
+ #include <stdexcept>
+ #include <string>
++#include <unordered_map>
+ 
+ #include "../epilogue.h"
+ #include "../fp8_utils.h"
+@@ -54,15 +59,182 @@ __global__ __launch_bounds__(256) void gemv_fp8_kernel(
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// Measured tile choice. Every tile accumulates each output over the same K-steps
++// in the same order, so all of them produce the same bits and the choice is
++// purely about speed. The first GEMM of a shape class times each eligible tile on
++// the caller's stream and keeps the fastest for the process; RDNA generations,
++// drivers and compilers move the crossover points, which fixed thresholds cannot
++// follow. launch_gemm_wmma's heuristic covers stream capture (no synchronization
++// is allowed there), a K no candidate divides and COMFY_KITCHEN_HIP_FP8_TUNE=0.
++// COMFY_KITCHEN_HIP_FP8_TUNE=verbose logs each choice;
++// COMFY_KITCHEN_HIP_FP8_TILE=<index into kFp8Tiles> forces a tile, for benchmarks.
++// ---------------------------------------------------------------------------
++
++template <typename OutT>
++struct Fp8Tile {
++    int bm, bn, bkb;
++    void (*launch)(const uint8_t*, const uint8_t*, OutT*, int, int, int, EpiTensorwise,
++                   hipStream_t);
++};
++
++// Only K % BKB == 0 reaches a tile, so only the loads without the K test exist.
++template <typename OutT, int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN>
++static void launch_fp8_tile(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int K,
++                            EpiTensorwise epi, hipStream_t stream) {
++    const dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
++    gemm_wmma_kernel<MmaFp8, EpiTensorwise, OutT, BM, BN, BKB, WARPS_M, WARPS_N, TM, TN,
++                     const uint8_t*, false>
++        <<<grid, WARPS_M * WARPS_N * kWave, 0, stream>>>(A, B, C, M, N, K, N, epi);
++}
++
++template <typename OutT, int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN>
++constexpr Fp8Tile<OutT> fp8_tile() {
++    return {BM, BN, BKB, &launch_fp8_tile<OutT, BM, BN, BKB, WARPS_M, WARPS_N, TM, TN>};
++}
++
++// The first five are launch_gemm_wmma's. 64x64 wave tiles (4x4) halve the LDS
++// fragment reads per MMA; 16 and 32 rows stop a small M from padding to 64.
++template <typename OutT>
++constexpr Fp8Tile<OutT> kFp8Tiles[] = {
++    fp8_tile<OutT, 64, 64, 64, 2, 2, 2, 2>(),
++    fp8_tile<OutT, 64, 64, 128, 2, 2, 2, 2>(),
++    fp8_tile<OutT, 128, 128, 64, 4, 2, 2, 4>(),
++    fp8_tile<OutT, 128, 128, 128, 4, 2, 2, 4>(),
++    fp8_tile<OutT, 128, 128, 128, 4, 4, 2, 2>(),
++    fp8_tile<OutT, 256, 128, 64, 4, 2, 4, 4>(),
++    fp8_tile<OutT, 128, 256, 64, 2, 4, 4, 4>(),
++    fp8_tile<OutT, 256, 128, 128, 8, 2, 2, 4>(),
++    fp8_tile<OutT, 128, 128, 64, 2, 2, 4, 4>(),
++    fp8_tile<OutT, 32, 128, 128, 2, 4, 1, 2>(),
++    fp8_tile<OutT, 16, 128, 128, 1, 4, 1, 2>(),
++};
++template <typename OutT>
++constexpr int kNumFp8Tiles = sizeof(kFp8Tiles<OutT>) / sizeof(kFp8Tiles<OutT>[0]);
++
++// A tile at least twice as tall or wide as the problem only adds padding.
++template <typename OutT>
++static bool fp8_tile_eligible(const Fp8Tile<OutT>& t, int M, int N, int K) {
++    return K % t.bkb == 0 && t.bm < 2 * M && t.bn < 2 * N;
++}
++
++struct Fp8TuneKey {
++    int device, m_class, n, k, out_code;
++    bool bias;
++    bool operator==(const Fp8TuneKey&) const = default;
++};
++
++struct Fp8TuneKeyHash {
++    size_t operator()(const Fp8TuneKey& k) const {
++        size_t h = static_cast<size_t>(k.device);
++        for (const int v : {k.m_class, k.n, k.k, k.out_code, static_cast<int>(k.bias)})
++            h = h * 1000003u ^ static_cast<size_t>(v);
++        return h;
++    }
++};
++
++// Quarter-octave M classes: 10264 and 10347 tokens share one, so a different
++// prompt length does not retune.
++static int fp8_m_class(int M) {
++    const int bits = 32 - __builtin_clz(static_cast<unsigned>(M));
++    return bits * 4 + (bits > 2 ? (M >> (bits - 3)) & 3 : 0);
++}
++
++// -1 tunes, -2 only uses the heuristic, >= 0 forces that tile.
++static int fp8_tile_mode(bool* verbose) {
++    static bool log = false;
++    static const int mode = [] {
++        if (const char* t = std::getenv("COMFY_KITCHEN_HIP_FP8_TILE"); t && *t) return std::atoi(t);
++        const char* u = std::getenv("COMFY_KITCHEN_HIP_FP8_TUNE");
++        log = u && std::string(u) == "verbose";
++        return (u && std::string(u) == "0") ? -2 : -1;
++    }();
++    *verbose = log;
++    return mode;
++}
++
++template <typename OutT>
++static int tune_fp8_tile(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int K,
++                         EpiTensorwise epi, hipStream_t stream, bool verbose) {
++    constexpr int kReps = 2;
++    hipEvent_t start, stop;
++    if (hipEventCreate(&start) != hipSuccess) return -1;
++    if (hipEventCreate(&stop) != hipSuccess) {
++        (void)hipEventDestroy(start);
++        return -1;
++    }
++    int best = -1;
++    float best_ms = std::numeric_limits<float>::max();
++    for (int i = 0; i < kNumFp8Tiles<OutT>; ++i) {
++        const Fp8Tile<OutT>& t = kFp8Tiles<OutT>[i];
++        if (!fp8_tile_eligible(t, M, N, K)) continue;
++        t.launch(A, B, C, M, N, K, epi, stream);  // first run loads the code object
++        float ms = 0.0f;
++        if (hipEventRecord(start, stream) != hipSuccess) { best = -1; break; }
++        for (int r = 0; r < kReps; ++r) t.launch(A, B, C, M, N, K, epi, stream);
++        if (hipEventRecord(stop, stream) != hipSuccess || hipEventSynchronize(stop) != hipSuccess ||
++            hipEventElapsedTime(&ms, start, stop) != hipSuccess) {
++            best = -1;
++            break;
++        }
++        if (verbose) {
++            std::fprintf(stderr, "comfy_kitchen fp8 tune M=%d N=%d K=%d: %dx%dx%d %.3f ms\n", M, N,
++                         K, t.bm, t.bn, t.bkb, ms / kReps);
++        }
++        if (ms < best_ms) {
++            best_ms = ms;
++            best = i;
++        }
++    }
++    (void)hipEventDestroy(start);
++    (void)hipEventDestroy(stop);
++    return best;
++}
++
++// The tile index to launch, or -1 for launch_gemm_wmma's heuristic.
++template <typename OutT>
++static int pick_fp8_tile(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int K,
++                         EpiTensorwise epi, hipStream_t stream, int out_code) {
++    bool verbose = false;
++    const int mode = fp8_tile_mode(&verbose);
++    if (mode >= 0) {
++        return mode < kNumFp8Tiles<OutT> && K % kFp8Tiles<OutT>[mode].bkb == 0 ? mode : -1;
++    }
++    if (mode == -2) return -1;
++
++    static std::mutex mutex;
++    static std::unordered_map<Fp8TuneKey, int, Fp8TuneKeyHash> chosen;
++    int device = 0;
++    if (hipGetDevice(&device) != hipSuccess) return -1;
++    const Fp8TuneKey key{device, fp8_m_class(M), N, K, out_code, epi.bias != nullptr};
++    {
++        std::lock_guard<std::mutex> lock(mutex);
++        if (auto it = chosen.find(key); it != chosen.end()) return it->second;
++    }
++    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
++    if (hipStreamIsCapturing(stream, &capture) != hipSuccess ||
++        capture != hipStreamCaptureStatusNone) {
++        return -1;
++    }
++    const int best = tune_fp8_tile<OutT>(A, B, C, M, N, K, epi, stream, verbose);
++    std::lock_guard<std::mutex> lock(mutex);
++    chosen.emplace(key, best);
++    return best;
++}
++
+ template <typename OutT>
+ static void launch_fp8(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int K,
+-                       EpiTensorwise epi, hipStream_t stream) {
++                       EpiTensorwise epi, hipStream_t stream, int out_code) {
+     if (M <= kGemvMaxM) {
+         dim3 block(kWave, 8);
+         dim3 grid((N + 7) / 8);
+         gemv_fp8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, epi);
+         return;
+     }
++    if (const int tile = pick_fp8_tile<OutT>(A, B, C, M, N, K, epi, stream, out_code); tile >= 0) {
++        kFp8Tiles<OutT>[tile].launch(A, B, C, M, N, K, epi, stream);
++        return;
++    }
+     launch_gemm_wmma<MmaFp8, EpiTensorwise, OutT>(A, B, C, M, N, K, N, epi, stream);
+ }
+ 
+@@ -93,11 +265,11 @@ extern "C" void launch_scaled_mm_fp8_kernel(
+     const uint8_t* B = static_cast<const uint8_t*>(b);
+ 
+     if (out_code == kBF16) {
+-        launch_fp8<__bf16>(A, B, static_cast<__bf16*>(c), M, N, K, epi, stream);
++        launch_fp8<__bf16>(A, B, static_cast<__bf16*>(c), M, N, K, epi, stream, out_code);
+     } else if (out_code == kF16) {
+-        launch_fp8<__half>(A, B, static_cast<__half*>(c), M, N, K, epi, stream);
++        launch_fp8<__half>(A, B, static_cast<__half*>(c), M, N, K, epi, stream, out_code);
+     } else if (out_code == kF32) {
+-        launch_fp8<float>(A, B, static_cast<float*>(c), M, N, K, epi, stream);
++        launch_fp8<float>(A, B, static_cast<float*>(c), M, N, K, epi, stream, out_code);
+     } else {
+         throw std::runtime_error("scaled_mm_fp8: unsupported output dtype");
+     }
+-- 
+2.43.0
+

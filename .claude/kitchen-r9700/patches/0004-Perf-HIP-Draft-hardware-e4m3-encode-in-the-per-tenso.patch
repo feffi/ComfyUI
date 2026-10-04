@@ -1,0 +1,80 @@
+From 0fb2e55b1d10258d71c2deeabfdc36baf2ad6b0c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 4 Oct 2026 20:15:46 +0000
+Subject: [PATCH 4/4] [Perf][HIP] Draft: hardware e4m3 encode in the per-tensor
+ fp8 quantize
+
+pack_fp8 encodes with log2f/exp2f and per-element branches, about 55 VALU
+per element on gfx1201. On gfx12, clamp to +-448 as pack_fp8 does and
+convert with v_cvt_pk_fp8_f32 (round to nearest even); NaN keeps pack_fp8's
+sign | 0x7f code.
+
+Unverified on hardware: equivalence with pack_fp8 for fp8 subnormals, -0.0
+and values rounding to zero has to be checked on a gfx12 GPU before use.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014FGDV3n1PG2QWogzESLcaZ
+---
+ comfy_kitchen/backends/hip/fp8_utils.h          | 17 +++++++++++++++++
+ .../backends/hip/ops/per_tensor_fp8.hip         |  6 +++---
+ 2 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/comfy_kitchen/backends/hip/fp8_utils.h b/comfy_kitchen/backends/hip/fp8_utils.h
+index bd86c33..1e8f7cb 100644
+--- a/comfy_kitchen/backends/hip/fp8_utils.h
++++ b/comfy_kitchen/backends/hip/fp8_utils.h
+@@ -125,6 +125,23 @@ __forceinline__ __device__ uint8_t pack_fp8(float value, int dtype_code) {
+     return static_cast<uint8_t>(sign_bit | (exponent_field << mantissa_bits) | mantissa_field);
+ }
+ 
++// pack_fp8 for the per-tensor quantize. gfx12 converts e4m3 in hardware
++// (v_cvt_pk_fp8_f32, round to nearest even) instead of the log2/exp2 arithmetic
++// above. pack_fp8's clamp to +-448 runs first, so the convert never sees a value
++// it would overflow, and a NaN keeps pack_fp8's sign | 0x7f code.
++__forceinline__ __device__ uint8_t encode_fp8(float value, int dtype_code) {
++#if defined(COMFY_MMA_GFX12)
++    if (dtype_code == kFp8E4M3Code) {
++        if (fp8_is_nan(value)) {
++            return static_cast<uint8_t>(((__float_as_uint(value) >> 24) & 0x80) | 0x7f);
++        }
++        const float clamped = fp8_clamp(value, -448.0f, 448.0f);
++        return static_cast<uint8_t>(__builtin_amdgcn_cvt_pk_fp8_f32(clamped, clamped, 0, false));
++    }
++#endif
++    return pack_fp8(value, dtype_code);
++}
++
+ __forceinline__ __device__ float unpack_fp8(uint8_t value, int dtype_code = kFp8E4M3Code) {
+     const bool e4m3 = dtype_code == kFp8E4M3Code;
+     const int mantissa_bits = e4m3 ? 3 : 2;
+diff --git a/comfy_kitchen/backends/hip/ops/per_tensor_fp8.hip b/comfy_kitchen/backends/hip/ops/per_tensor_fp8.hip
+index 5492e91..1395930 100644
+--- a/comfy_kitchen/backends/hip/ops/per_tensor_fp8.hip
++++ b/comfy_kitchen/backends/hip/ops/per_tensor_fp8.hip
+@@ -46,7 +46,7 @@ __global__ void quantize_per_tensor_fp8_kernel(
+         return;
+     }
+     const float scaled = to_float(input[idx]) / scale[0];
+-    output[idx] = pack_fp8(scaled, output_dtype_code);
++    output[idx] = encode_fp8(scaled, output_dtype_code);
+ }
+ 
+ template<typename OutputType>
+@@ -85,12 +85,12 @@ __global__ void quantize_per_tensor_fp8_vec_kernel(
+         VecChunk<uint8_t> out;
+         #pragma unroll
+         for (int i = 0; i < kVecElems; ++i) {
+-            out.v[i] = pack_fp8(to_float(in.v[i]) / s, output_dtype_code);
++            out.v[i] = encode_fp8(to_float(in.v[i]) / s, output_dtype_code);
+         }
+         *reinterpret_cast<VecChunk<uint8_t>*>(output + i0) = out;
+     } else {
+         for (int64_t i = i0; i < numel; ++i) {
+-            output[i] = pack_fp8(to_float(input[i]) / s, output_dtype_code);
++            output[i] = encode_fp8(to_float(input[i]) / s, output_dtype_code);
+         }
+     }
+ }
+-- 
+2.43.0
+
