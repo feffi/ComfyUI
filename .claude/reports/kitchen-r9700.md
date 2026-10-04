@@ -17,17 +17,17 @@ read of the source. Every speed effect is an estimate until `bench_fp8_gemm.py` 
 |---|---|---|---|
 | 0001 | GEMM core: branch-free, coalesced tile loads | bit-identical (emulated) | big M: a few % (per K tile and wave, same compiler: 45 VALU, 42 SALU, 11 branches -> 24, 8, 3); applies to every WMMA GEMM user |
 | 0002 | fp8 GEMV, M <= 8: hardware decode, weight read once | bit-identical (emulated, FMA order checked in ISA) | M~2, K=4096, N=16384: from 0.55 ms towards the 0.10 ms bandwidth floor (hipBLASLt 0.11) |
-| 0003 | six more tiles, measured tile choice per shape class | bit-identical by construction; tiles 0-5 emulated, 6-10 pending | big M, K <= 6144: 0 to ~15 % depending on whether LDS bandwidth limits today's tile; never slower than today's choice by more than timing noise |
+| 0003 | six more tiles, measured tile choice per shape class | bit-identical (every tile and the tuned path emulated) | big M, K <= 6144: 0 to ~15 % depending on whether LDS bandwidth limits today's tile; never slower than today's choice by more than timing noise |
 | 0004 | per-tensor quantize: hardware e4m3 encode | **unverified** | quantize goes from VALU-bound (~55 VALU and ~7 branches per element) towards memory-bound; run `check_fp8_quantize.py` first |
 
 Bit identity of 0001-0003 holds by construction: every output element still runs
 through one accumulator that receives the same WMMA K-steps in the same order, so a
 tile's shape changes only scheduling. The emulator confirms it on the source: 17
 shapes (GEMV, every tile path, partial M and N tiles, K tails, f32/f16/bf16 out,
-with and without bias) for v0.2.36 and for 0001 and 0002: 0 differing bytes. For
-0003, tiles 0-5 forced in turn: 0 differing bytes; tiles 6-10 forced and the tuned
-default were still running in the emulator at this commit (the tuned run had passed
-13 of 17 cases).
+with and without bias) for v0.2.36, for 0001 and 0002, for each of the 11 tiles of
+0003 forced in turn, and for 0003's tuned default: 0 differing bytes in all 14 runs.
+The emulator's timer reports equal times, so the tuned run exercises the tuning loop
+(every eligible tile writes the output, then the pick runs) but not the pick itself.
 
 ## Why kitchen loses to hipBLASLt at K <= 6144
 

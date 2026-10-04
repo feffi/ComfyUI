@@ -8,7 +8,7 @@ apply there too. Findings and expected effects: `.claude/reports/kitchen-r9700.m
 |---|---|---|---|
 | `0001` | WMMA GEMM core: coalesced, branch-free tile loads; K-tail test only in kernels whose K is not a multiple of BKB | bit-identical | CPU emulation of the kernel source, ISA |
 | `0002` | fp8 GEMV (M <= 8): hardware fp8 decode on gfx12, all M rows per wave so the weight is read once | bit-identical | CPU emulation, ISA (FMA order) |
-| `0003` | fp8 GEMM: six more tiles plus a measured tile choice per shape class | bit-identical | CPU emulation of tiles 0-5 (6-10 pending), ISA (no spills) |
+| `0003` | fp8 GEMM: six more tiles plus a measured tile choice per shape class | bit-identical | CPU emulation of every tile and the tuned path, ISA (no spills) |
 | `0004` | per-tensor fp8 quantize: hardware e4m3 encode on gfx12 (draft) | **unverified** | compile only; run `check_fp8_quantize.py` first |
 
 Patches 0001-0003 are independent of 0004; apply 0001-0003 alone if 0004 fails its check.
