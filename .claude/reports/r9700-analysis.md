@@ -114,7 +114,7 @@ The local session adopted the branch on 04.10.2026 (Krea 2 at 1280x2048, cfg 1.8
 | 0003 | six more tiles (64x64 wave tiles: a third fewer LDS reads per MMA; 16/32-row tiles for small M) and a measured tile choice per shape class instead of fixed thresholds | bit-identical | 0 to ~15 % at K <= 6144; first GEMM per class pays ~0.2-0.4 s of tuning; `COMFY_KITCHEN_HIP_FP8_TUNE=0` restores 0.2.36 |
 | 0004 | draft: hardware e4m3 encode (`v_cvt_pk_fp8_f32`) in the per-tensor quantize | **unverified** | quantize from VALU-bound towards memory-bound |
 
-0001-0003 feed every output the same WMMA K-steps in the same order. A CPU emulation running kitchen's kernel source confirms it: 17 cases (GEMV, every tile path, K tails, partial tiles, three output dtypes, bias), 0 differing bytes against v0.2.36 for 0001, 0002, each of the 11 tiles forced and the tuned default. 0004 ships with `check_fp8_quantize.py` (every bf16 and fp16 pattern, every e4m3 midpoint) and stays out if one byte differs.
+0001-0003 feed every output the same WMMA K-steps in the same order. A CPU emulation running kitchen's kernel source confirms it: 17 cases (GEMV, every tile path, K tails, partial tiles, three output dtypes, bias), 0 differing bytes against v0.2.36 for 0001, 0002, each of the 11 tiles forced and the tuned default. 0004 ships with `check_fp8_quantize.py` (every bf16 and fp16 pattern, every e4m3 midpoint) and stays out if one byte differs. Phase 7 of the measurement prompt builds the patches into a separate folder (the production venv stays untouched), runs both scripts against the installed 0.2.36, sweeps the tiles against the tuner's picks and compares Krea 2 and Qwen-Image 2.1 end to end with fp8 weights, ending in keep/drop per patch.
 
 ### GPU checks still owed
 
@@ -131,8 +131,8 @@ The kitchen HIP kernels and multi-GPU paths behind these commits never ran here.
 | `e9c38f9` | CFG Split with cfg > 1 and batch 2: s/it (`run_placement_bench.py --cfg 4 --cfg-split`) | revert |
 | `e997bcb` | startup log on both cards still reports the expected attention line | revert |
 | `3781fb9` | only with TorchCompileModel (`tools/A5/ab_compile.py --variants baseline,torch_compile`) | none needed for eager runs |
-| kitchen 0001-0003 | `.claude/kitchen-r9700/bench_fp8_gemm.py --ref` against the installed 0.2.36: `identical` on every shape, then ms per shape and the Krea 2 block total against 47.0 / 40.9 ms; `--sweep-tiles` to see the tuner's choices | drop the patch; for 0003 alone `COMFY_KITCHEN_HIP_FP8_TUNE=0` |
-| kitchen 0004 | `.claude/kitchen-r9700/check_fp8_quantize.py --ref`: 0 differing bytes | leave 0004 out |
+| kitchen 0001-0003 (prompt phase 7) | `.claude/kitchen-r9700/bench_fp8_gemm.py --ref` against the installed 0.2.36: `identical` on every shape, then ms per shape and the Krea 2 block total against 47.0 / 40.9 ms; `--sweep-tiles` to see the tuner's choices | drop the patch; for 0003 alone `COMFY_KITCHEN_HIP_FP8_TUNE=0` |
+| kitchen 0004 (prompt phase 7) | `.claude/kitchen-r9700/check_fp8_quantize.py --ref`: 0 differing bytes | leave 0004 out |
 
 Known limits:
 - `da79103` relies on the HIP kernel accumulating in fp32. kitchen documents `fp16_conv3d` as fp16-accumulate, so this is fork-only under AGENTS.md. Re-check the disassembly when you bump comfy-kitchen.
@@ -187,7 +187,7 @@ Core EasyCache on H3: a third-party measurement found `end_percent` ≤ 0.70 giv
 
 ## 7. Benchmark protocol
 
-`.claude/prompts/r9700-measurement-run.md` runs this whole protocol on the R9700 machine and returns a keep/revert verdict per commit. Run against a separate instance (`--port 8199`), on GPU 1 when GPU 0 is busy. 3 runs, report the median. Record driver, ROCm wheel, HIP, torch, comfy-kitchen, comfy-aimdo and ComfyUI commit with every number (`tools/A6/a6_stability_check.py` prints them).
+`.claude/prompts/r9700-measurement-run.md` runs this whole protocol on the R9700 machine and returns a keep/revert verdict per commit and per comfy-kitchen patch. Run against a separate instance (`--port 8199`), on GPU 1 when GPU 0 is busy. 3 runs, report the median. Record driver, ROCm wheel, HIP, torch, comfy-kitchen, comfy-aimdo and ComfyUI commit with every number (`tools/A6/a6_stability_check.py` prints them).
 
 | Question | Tool |
 |---|---|
@@ -197,6 +197,7 @@ Core EasyCache on H3: a third-party measurement found `end_percent` ≤ 0.70 giv
 | Attention backends per real shape (SDPA native/expanded, flash/efficient/math, kitchen int8, sol, VAE slice) | `tools/A1/attn_bench.py --device 1 --explain --profile` |
 | bf16 vs fp8 vs int8 linears, hipBLASLt vs rocBLAS, TunableOp | `tools/A2/gemm_bench.py --model <file> --tokens <n> --device 1` |
 | Top kernels per denoising step | `tools/A2/comfy_profile_step` (custom node; load via `extra_paths_profile.yaml` in the test instance only) |
+| comfy-kitchen patches against the installed 0.2.36 (phase 7 of the measurement prompt) | from `.claude/kitchen-r9700/`, patched build on `PYTHONPATH`: `check_fp8_quantize.py --ref`, `bench_fp8_gemm.py --ref`, `bench_fp8_gemm.py --sweep-tiles` |
 | Regression tests, patched and unpatched build (phase 1a of the measurement prompt) | `python -m pytest -p no:cacheprovider -rs <the 7 files above>` with `CUDA_VISIBLE_DEVICES=1`, `HIP_VISIBLE_DEVICES=1` |
 | Krea 2 fused kernels (`377a3f9`) | `tools/A2/krea2_block_bench.py --device 1 --tokens 4608` |
 | Model placement across cards, per-GPU peak VRAM, evictions | `tools/A3/run_placement_bench.py --model minimax\|krea2\|qi21 --placement single\|split` |
