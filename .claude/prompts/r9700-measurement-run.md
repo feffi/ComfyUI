@@ -1,10 +1,10 @@
 # Measurement run: ComfyUI on 2× R9700 (Windows)
 
-Paste everything below the line into Claude Code on the R9700 machine, started in the directory that holds the production ComfyUI checkout. It measures what the static analysis in `.claude/reports/r9700-analysis.md` (branch `claude/cool-euler-0g3imw`) could only estimate, and returns a keep/revert verdict for each of the 15 branch commits.
+Paste everything below the line into Claude Code on the R9700 machine, started in the directory that holds the production ComfyUI checkout. It measures what the static analysis in `.claude/reports/r9700-analysis.md` (branch `claude/cool-euler-0g3imw`) could only estimate, and returns a keep/revert verdict for each of the 15 branch commits and the four comfy-kitchen patches.
 
 ---
 
-You are running a measurement session on a Windows machine with two AMD Radeon AI PRO R9700 (gfx1201). An earlier static analysis produced 15 ComfyUI commits, a commit of regression tests for them and a list of launch and system recommendations, all verified on CPU only. Your job is to measure them on this hardware, decide keep/revert per commit, and turn the estimates into numbers. Correctness first, then speed.
+You are running a measurement session on a Windows machine with two AMD Radeon AI PRO R9700 (gfx1201). An earlier static analysis produced 15 ComfyUI commits, a commit of regression tests for them, four patches to comfy-kitchen's HIP kernels and a list of launch and system recommendations, all verified on CPU only. Your job is to measure them on this hardware, decide keep/revert per commit, and turn the estimates into numbers. Correctness first, then speed.
 
 ## Known stack (verify, report any drift)
 
@@ -19,7 +19,7 @@ You are running a measurement session on a Windows machine with two AMD Radeon A
 2. **Never change system settings.** No driver installs, registry edits (TDR), Defender exclusions, power plans or BIOS. Report them as recommendations only.
 3. **Do not stop or restart the production ComfyUI instance yourself.** If it is running and holding a GPU, ask me to stop it before the GPU phases. Test instances use ports 8198 and 8199 only.
 4. **One GPU workload at a time per card.** Never run two benchmarks on the same GPU concurrently, and never benchmark while another process uses that card (check with the device query in phase 0 before every block of runs). Subagents may only do work that does not touch the GPUs: reading code, parsing logs, writing the report.
-5. **Ask before:** creating a cloned venv (disk heavy), anything above ~50 GB of new disk use, running a test that the tool marks as TDR-risky above 512×512, or resolving a cherry-pick conflict that is not purely mechanical.
+5. **Ask before:** creating a cloned venv (disk heavy), installing the ROCm devel SDK into a build venv (several GB, phase 7), anything above ~50 GB of new disk use, running a test that the tool marks as TDR-risky above 512×512, or resolving a cherry-pick conflict that is not purely mechanical.
 6. **Never invent numbers.** Every figure in the results comes from a run you did in this session, with its log file. Anything you could not run is listed as "not measured" with the reason.
 7. **Checkpoint after every phase:** append results to `<RESULTS>\results.jsonl` and update `<RESULTS>\r9700-measurements.md`, so the run can resume after a crash or reboot. On resume, read both files and continue at the first incomplete phase.
 
@@ -38,6 +38,7 @@ You are running a measurement session on a Windows machine with two AMD Radeon A
   git -C <WT>\tests-baseline cherry-pick b09048c 37b7bce  # the same tests against unpatched code
   git -C <PROD> show feffi/claude/cool-euler-0g3imw:.claude/reports/r9700-analysis.md > <RESULTS>\analysis.md
   git -C <PROD> archive feffi/claude/cool-euler-0g3imw .claude/reports/r9700/tools | tar -x -C <RESULTS>
+  git -C <PROD> archive feffi/claude/cool-euler-0g3imw .claude/kitchen-r9700 .claude/reports/kitchen-r9700.md | tar -x -C <RESULTS>
   ```
   The branch is based on e9027f2, not 8cfe5e1e. If a cherry-pick conflicts, resolve it only when the conflict is mechanical (context drift) and log the resolution; otherwise skip that commit, mark it "not applied", and ask me.
 - Both worktrees run with the production venv's python, with `--base-directory` or `--extra-model-paths-config` pointing at the production models, `--disable-auto-launch`, and their own `--database-url sqlite:///<RESULTS>/<name>.db`. Custom nodes: load the same set as production (copy or junction `custom_nodes` read-only) so baseline and patched differ only by the commits.
@@ -148,6 +149,18 @@ Each against the phase 2 patched result, same workflows:
 3. **Power and thermals:** if a local tool exposes GPU clock, power and temperature (look for `amd-smi` in the ROCm wheels or any vendor CLI already installed; install nothing), log them at 1 Hz during a 10-minute H3 run on both cards. Report whether clocks sag over time.
 4. **Coexistence:** does importing onnxruntime-directml or insightface in the same process change device enumeration, VRAM or startup time? Compare a test instance with and without the custom nodes that pull them in.
 
+## Phase 7: comfy-kitchen patches
+
+Four patches against the installed comfy-kitchen 0.2.36 (`<RESULTS>\.claude\kitchen-r9700\patches\`, background in `<RESULTS>\.claude\reports\kitchen-r9700.md`): 0001 branch-free tile loads in the WMMA GEMM core, 0002 small-M fp8 GEMV, 0003 more fp8 tiles with a measured tile choice, 0004 hardware e4m3 encode in the quantize (draft, unverified). 0001-0003 must give byte-identical output. Run the two scripts from `<RESULTS>\.claude\kitchen-r9700\` with the production venv's python, on GPU 1 alone; the production instance must not use that card.
+
+1. **Build** as in `<RESULTS>\.claude\kitchen-r9700\README.md`, with every path under `<RESULTS>\kitchen\` instead of `C:\kt`: clone, `git am` all four patches onto `888b13e`, a gfx1201-only wheel, then `pip install --no-deps --target <RESULTS>\kitchen\patched`. Only the build venv gets packages; ask before installing the ROCm devel SDK there. The patched build reaches a process only through `PYTHONPATH=<RESULTS>\kitchen\patched`; check the `kitchen_path` line the benchmark prints. Log the build to `<RESULTS>\logs\kitchen-build.log`. Fix Windows-only build breakage in the clone if it is mechanical and log it; anything else marks the phase "not measured" with the error.
+2. **Quantize check (0004):** `check_fp8_quantize.py --device 1 --save <RESULTS>\kitchen\quant_0236.pt` without `PYTHONPATH`, then with it and `--ref`. Any differing byte: 0004 is **drop**; rebuild with 0001-0003 only (`git am` the first three onto a fresh checkout) before step 3.
+3. **GEMM benchmark:** `bench_fp8_gemm.py --device 1 --save-ref <RESULTS>\kitchen\ref_0236.pt` without `PYTHONPATH` (installed 0.2.36, hipBLASLt column included), then with `PYTHONPATH` set, `COMFY_KITCHEN_HIP_FP8_TUNE=verbose` and `--ref`. Save both tables and the stderr tuning log. Pass: `identical` is `True` on every shape. A `False` means the set is **drop**; find the patch by rebuilding with 0001 alone, then 0001+0002. Report ms per shape for installed, patched and hipBLASLt, and the Krea 2 block totals; the local session measured 47.0 ms (kitchen 0.2.36), 49.9 (hipBLASLt untuned) and 40.9 (TunableOp).
+4. **Tile sweep:** `bench_fp8_gemm.py --device 1 --sweep-tiles` with `PYTHONPATH` set. For every shape, compare the fastest tile with the tuner's pick from the step 3 log; report each shape where the pick is more than 3 % slower than the best tile.
+5. **End to end:** Krea 2 and Qwen-Image 2.1 workflows on `<WT>\patched`, with fp8 weights (`fp8_e4m3fn_fast` or an fp8 checkpoint; bf16 weights never reach these kernels), once with the installed kitchen and once with `PYTHONPATH` set. Same seeds. Pass: max abs diff of the output images is 0. Report s/it, total, and first-run against warm time, since the tuner times each new shape class once inside the first sampling step (expected 0.2-0.4 s per large Krea 2 shape). One more run with `COMFY_KITCHEN_HIP_FP8_TUNE=0` isolates 0001 + 0002 from the tuner.
+
+Verdict per patch: keep / drop / inconclusive. If kitchen with 0001-0003 is at least as fast as hipBLASLt on every benchmarked shape, say so: a per-shape choice between the two backends would then be unnecessary.
+
 ## Results
 
 Write `<RESULTS>\r9700-measurements.md` (under 300 lines) and keep `results.jsonl` with every raw run. Lead each section with the decision:
@@ -160,6 +173,7 @@ Write `<RESULTS>\r9700-measurements.md` (under 300 lines) and keep `results.json
 6. **Startup:** cold and warm, top costs, savings per action.
 7. **New findings** from phase 6, with proposed fixes described in the same format as the analysis report (location, change, effect, risk).
 8. **Corrections** to the analysis report: every estimate that the measurements contradict.
-9. **Not measured:** what you skipped and why.
+9. **comfy-kitchen patches:** verdict per patch, quantize check result, ms per shape (installed, patched, hipBLASLt), Krea 2 block totals, tuner picks against the sweep's best tiles, end-to-end s/it and first-run overhead.
+10. **Not measured:** what you skipped and why.
 
-Do not commit or push anything. When finished, leave all worktrees in place (baseline, patched, tests-baseline and any bisect ones) and tell me the cleanup commands (`git worktree remove`) instead of running them.
+Do not commit or push anything. When finished, leave all worktrees in place (baseline, patched, tests-baseline and any bisect ones) and `<RESULTS>\kitchen\` (clone, build venv, patched build), and tell me the cleanup commands (`git worktree remove`, the folders to delete) instead of running them.
