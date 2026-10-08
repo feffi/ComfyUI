@@ -1,0 +1,176 @@
+From afcbcfdd8507ebc140aa322db4c4c90c75cea092 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 8 Oct 2026 10:42:17 +0000
+Subject: [PATCH 5/7] [Perf][HIP] adaln/rms_adaln: one wave per row with
+ 16-byte accesses
+
+adaln_kernel runs one 256-thread block per row with 2-byte loads, reads the
+row three times through a runtime dtype switch and reduces through eight
+shared-memory barrier rounds; Krea 2's rms_adaln on (10264, 6144) bf16 runs
+at about 300 GB/s. For 2-byte rows with D a multiple of 256 and scale/shift
+in x's dtype, run one wave per row instead: each lane stands in for eight of
+the block's threads, loads 16 bytes per step, keeps their per-thread sums in
+the same order and adds the 256 partials in the same pairs as the
+shared-memory tree, through lane shuffles. The steps adaln_kernel's compiled
+code fuses (each square into its sum, the eps add, the shift add) are written
+as fmas, so results are bit-identical however the new kernel is contracted.
+Other shapes keep the block kernel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014FGDV3n1PG2QWogzESLcaZ
+---
+ comfy_kitchen/backends/hip/ops/adaln.hip | 131 +++++++++++++++++++++++
+ 1 file changed, 131 insertions(+)
+
+diff --git a/comfy_kitchen/backends/hip/ops/adaln.hip b/comfy_kitchen/backends/hip/ops/adaln.hip
+index ef68127..6f29309 100644
+--- a/comfy_kitchen/backends/hip/ops/adaln.hip
++++ b/comfy_kitchen/backends/hip/ops/adaln.hip
+@@ -101,6 +101,118 @@ __global__ __launch_bounds__(kAdaLNThreads) void adaln_kernel(
+     }
+ }
+ 
++// Fast path for 2-byte rows with D a multiple of 256 and scale/shift in x's dtype:
++// one wave per row, 16-byte accesses, no shared memory or barriers. adaln_kernel
++// spends most of its time on 2-byte loads and the eight barrier rounds of its
++// tree, at about half the memory bandwidth.
++//
++// Lane l stands in for threads 8l .. 8l+7 of adaln_kernel: at step k it owns
++// elements 256k + 8l + j, accumulates element j into acc[j] in the order thread
++// 8l+j does, and wave_tree_sum adds the 256 partials in the pairs the shared-memory
++// tree uses. The three steps adaln_kernel's compiled code fuses (each square into
++// its sum, the eps add and the shift add) are spelled out as fmas, so every result
++// is bit-identical to adaln_kernel however this kernel is contracted.
++constexpr int kAdaLNWave = 32;
++constexpr int kAdaLNWaveRows = 8;  // one row per wave, eight waves per block
++
++// adaln_kernel's tree over 256 threads: stride s adds partial t + s into t. Lane l
++// holds threads 8l + j, so strides 128 .. 8 pair lane l with lane l ^ (s / 8) and
++// strides 4 .. 1 stay inside lane 0. Reassociation would regroup the adds, so it is
++// off here and in the accumulation loops. The sum comes back wave-uniform, as
++// adaln_kernel's read of red[0] does, so both evaluate the rsqrt on the scalar path.
++__forceinline__ __device__ float wave_tree_sum(float (&a)[8]) {
++#pragma clang fp reassociate(off)
++    #pragma unroll
++    for (int off = kAdaLNWave / 2; off > 0; off >>= 1) {
++        #pragma unroll
++        for (int j = 0; j < 8; ++j) a[j] += __shfl_xor(a[j], off, kAdaLNWave);
++    }
++    a[0] += a[4];
++    a[1] += a[5];
++    a[2] += a[6];
++    a[3] += a[7];
++    a[0] += a[2];
++    a[1] += a[3];
++    a[0] += a[1];
++    return __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, a[0]), 0));
++}
++
++template <typename T>
++constexpr int kAdaLNCode = std::is_same_v<T, __bf16> ? 2 : 1;
++
++// Eight elements at p, decoded as load_in decodes them.
++template <typename T>
++__forceinline__ __device__ void load8(const T* __restrict__ p, float (&f)[8]) {
++    const uint4 raw = *reinterpret_cast<const uint4*>(p);
++    const T* e = reinterpret_cast<const T*>(&raw);
++    #pragma unroll
++    for (int j = 0; j < 8; ++j) f[j] = load_in(e, j, kAdaLNCode<T>);
++}
++
++template <typename T, bool SubtractMean>
++__global__ __launch_bounds__(kAdaLNWaveRows* kAdaLNWave) void adaln_wave_kernel(
++    const T* __restrict__ x, const T* __restrict__ scale, const T* __restrict__ shift,
++    T* __restrict__ out, int N, int D, int scale_group, int shift_group, float eps) {
++
++    const int row = blockIdx.x * kAdaLNWaveRows + threadIdx.x / kAdaLNWave;
++    if (row >= N) return;
++    const int col = 8 * (threadIdx.x % kAdaLNWave);
++    const int steps = D / kAdaLNThreads;
++
++    const int64_t xbase = static_cast<int64_t>(row) * D + col;
++    const int64_t sbase = static_cast<int64_t>(row / scale_group) * D + col;
++    const int64_t hbase = static_cast<int64_t>(row / shift_group) * D + col;
++
++    // D stays a runtime value: adaln_kernel's 1 / D is a v_rcp, which a
++    // compile-time D would fold to a different, exact quotient.
++    const float inv_d = 1.0f / static_cast<float>(D);
++
++    float mean = 0.0f;
++    if constexpr (SubtractMean) {
++        float acc[8] = {};
++        {
++#pragma clang fp reassociate(off)
++            for (int k = 0; k < steps; ++k) {
++                float v[8];
++                load8(x + xbase + k * kAdaLNThreads, v);
++                #pragma unroll
++                for (int j = 0; j < 8; ++j) acc[j] += v[j];
++            }
++        }
++        mean = wave_tree_sum(acc) * inv_d;
++    }
++
++    float acc[8] = {};
++    {
++#pragma clang fp reassociate(off)
++        for (int k = 0; k < steps; ++k) {
++            float v[8];
++            load8(x + xbase + k * kAdaLNThreads, v);
++            #pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                const float d = v[j] - mean;
++                acc[j] = __builtin_fmaf(d, d, acc[j]);
++            }
++        }
++    }
++    const float rstd = rsqrtf(__builtin_fmaf(wave_tree_sum(acc), inv_d, eps));
++
++    for (int k = 0; k < steps; ++k) {
++        const int64_t o = k * kAdaLNThreads;
++        float v[8], s[8], h[8];
++        load8(x + xbase + o, v);
++        load8(scale + sbase + o, s);
++        load8(shift + hbase + o, h);
++        alignas(16) T res[8];
++        #pragma unroll
++        for (int j = 0; j < 8; ++j) {
++            const float norm = (v[j] - mean) * rstd;
++            store_out<T>(res, j, __builtin_fmaf(norm, 1.0f + s[j], h[j]));
++        }
++        *reinterpret_cast<uint4*>(out + xbase + o) = *reinterpret_cast<const uint4*>(res);
++    }
++}
++
+ }  // namespace comfy::hip_backend
+ 
+ // subtract_mean selects LayerNorm (true) or RMSNorm (false) statistics.
+@@ -117,6 +229,25 @@ extern "C" void launch_adaln_kernel(
+         return;  // a zero-block launch is hipErrorInvalidConfiguration
+     }
+ 
++    const bool aligned = ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(scale) |
++                           reinterpret_cast<uintptr_t>(shift) | reinterpret_cast<uintptr_t>(out)) &
++                          15u) == 0;
++    if ((code == 1 || code == 2) && scale_code == code && shift_code == code &&
++        D % kAdaLNThreads == 0 && aligned) {
++        const int blocks = (N + kAdaLNWaveRows - 1) / kAdaLNWaveRows;
++#define CK_ADALN_WAVE(T, MEAN)                                                                 \
++    adaln_wave_kernel<T, MEAN><<<blocks, kAdaLNWaveRows * kAdaLNWave, 0, stream>>>(            \
++        static_cast<const T*>(x), static_cast<const T*>(scale), static_cast<const T*>(shift),  \
++        static_cast<T*>(out), N, D, scale_group, shift_group, eps)
++        if (code == 2) {
++            if (subtract_mean) CK_ADALN_WAVE(__bf16, true); else CK_ADALN_WAVE(__bf16, false);
++        } else {
++            if (subtract_mean) CK_ADALN_WAVE(__half, true); else CK_ADALN_WAVE(__half, false);
++        }
++#undef CK_ADALN_WAVE
++        return;
++    }
++
+ #define CK_ADALN_LAUNCH(T, MEAN)                                                             \
+     adaln_kernel<T, MEAN><<<N, kAdaLNThreads, 0, stream>>>(                                  \
+         x, scale, shift, static_cast<T*>(out), D, scale_group, shift_group, eps, code,       \
+-- 
+2.43.0
+

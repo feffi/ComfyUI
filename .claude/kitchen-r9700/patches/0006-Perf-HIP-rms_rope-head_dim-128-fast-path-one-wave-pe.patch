@@ -1,0 +1,291 @@
+From 6debcbb5dd8e73aa94b95e18576b15e2ce8fd500 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 8 Oct 2026 11:05:29 +0000
+Subject: [PATCH 6/7] [Perf][HIP] rms_rope: head_dim 128 fast path, one wave
+ per token
+
+rms_rope_kernel runs one 64-thread block per row with 2-byte accesses, six
+shared-memory barrier rounds and four freqs loads per pair, and reloads a
+token's freqs for every head; Krea 2's rms_rope on 48 + 12 heads of 10264
+tokens runs at about 200 GB/s. For 2-byte q/k with head_dim 128, dense
+8-byte-aligned rows and freqs broadcast over the head axis, one wave now
+takes one token: it loads the token's freqs and weights once, loops over the
+heads four rows at a time with 8-byte accesses, and reduces each row through
+DPP and v_permlanex16 instead of shared memory.
+
+Results are bit-identical to rms_rope_kernel as 0.2.36 compiles it. That is
+not quite its source order (the squares are fused into the running sum,
+rotated elements are scaled as (rrms * w) * x, rope_combine's fp32 form fuses
+f_b * x_b and its rounded forms add without fusing), so the fast path spells
+each of those out instead of leaving them to contraction. Other shapes keep
+the block kernel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014FGDV3n1PG2QWogzESLcaZ
+---
+ comfy_kitchen/backends/hip/ops/rms_rope.hip | 242 ++++++++++++++++++++
+ 1 file changed, 242 insertions(+)
+
+diff --git a/comfy_kitchen/backends/hip/ops/rms_rope.hip b/comfy_kitchen/backends/hip/ops/rms_rope.hip
+index 29a338b..32d4b30 100644
+--- a/comfy_kitchen/backends/hip/ops/rms_rope.hip
++++ b/comfy_kitchen/backends/hip/ops/rms_rope.hip
+@@ -127,6 +127,195 @@ __global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel(
+     }
+ }
+ 
++// head_dim 128 fast path for 2-byte q/k whose rows are dense. rms_rope_kernel
++// spends its time on 2-byte accesses, six barrier rounds and four freqs loads
++// per pair, and re-reads a token's freqs for every head: Krea 2's q and k run at
++// about 200 GB/s. Here one wave takes one token, loads its freqs and weights once
++// and loops over the heads that share them, four rows in flight.
++//
++// Lane l owns elements 4l .. 4l+3 (8 bytes). It stands in for threads 4l .. 4l+3 of
++// rms_rope_kernel, whose second elements 4l+64 .. sit in lane l ^ 16. The results
++// are bit-identical to rms_rope_kernel as 0.2.36 compiles it, which is not quite
++// its source order: the sums of squares fuse each square into the running sum,
++// rotated elements are scaled as (rrms * w) * x, and rope_combine's fp32 form fuses
++// f_b * x_b while its rounded forms add without fusing. The fast path spells each
++// of those out, so its rounding does not depend on how the compiler contracts it.
++constexpr int kRope128Waves = 8;  // tokens (waves) per block
++constexpr int kRopeWave = 32;
++constexpr int kRope128Unroll = 4;
++
++// Lane l ^ Mask's v, without LDS: DPP row_xmask below 16, v_permlanex16 for 16.
++template <int Mask>
++__forceinline__ __device__ float lane_xor(float v) {
++    const int bits = __builtin_bit_cast(int, v);
++    if constexpr (Mask == 16) {
++        return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(bits, bits, 0x76543210,
++                                                                      0xfedcba98, false, false));
++    } else {
++        return __builtin_bit_cast(float,
++                                  __builtin_amdgcn_update_dpp(0, bits, 0x160 + Mask, 0xf, 0xf, true));
++    }
++}
++
++// rms_rope_kernel's statistics for one row: thread t squares element t, then fuses
++// element t + 64's square into it; stride s of its tree adds partial t + s into t.
++// Strides 32 .. 4 pair lane l with l ^ (s / 4) and strides 2, 1 stay inside lane 0.
++__forceinline__ __device__ float rope128_sum_sq(const float (&v)[4]) {
++#pragma clang fp contract(off) reassociate(off)
++    float a[4];
++    #pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const float u = lane_xor<16>(v[i]);
++        a[i] = __builtin_fmaf(u, u, v[i] * v[i]);
++        a[i] += lane_xor<8>(a[i]);
++        a[i] += lane_xor<4>(a[i]);
++        a[i] += lane_xor<2>(a[i]);
++        a[i] += lane_xor<1>(a[i]);
++    }
++    a[0] += a[2];
++    a[1] += a[3];
++    a[0] += a[1];
++    return __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, a[0]), 0));
++}
++
++template <typename T>
++constexpr int kRopeCode = std::is_same_v<T, __bf16> ? 2 : 1;
++
++// rope_combine with rms_rope_kernel's compiled rounding. x_a and x_b come rounded to
++// T, so rounding them to the freqs dtype is a no-op when that is T.
++template <typename T, int kFCode, bool kSplitHalf>
++__forceinline__ __device__ float rope128_combine(float f_a, float x_a, float f_b, float x_b) {
++#pragma clang fp contract(off)
++    if constexpr (kFCode == 0) {
++        return __builtin_fmaf(f_b, x_b, f_a * x_a);
++    } else {
++        using F = std::conditional_t<kFCode == 2, __bf16, __half>;
++        if constexpr (kFCode != kRopeCode<T>) {
++            x_a = round_to<F>(x_a);
++            x_b = round_to<F>(x_b);
++        }
++        const float pa = round_to<F>(round_to<F>(f_a) * x_a);
++        const float second = round_to<F>(f_b) * x_b;
++        return round_to<F>(pa + (kSplitHalf ? round_to<F>(second) : second));
++    }
++}
++
++// Normalize, scale and rotate one row held as 4 elements per lane. fa/fb are the
++// two freqs factors of each element's output, w the weight; split_half rows
++// exchange the rounded halves with the lane n_pairs / 4 away.
++template <typename T, int kFCode, bool kSplitHalf>
++__forceinline__ __device__ void rope128_row(uint2 raw, T* out, const float (&w)[4],
++                                            const float (&fa)[4], const float (&fb)[4],
++                                            int e0, int rot_dim, float inv_d, float epsilon) {
++#pragma clang fp contract(off) reassociate(off)
++    const T* x = reinterpret_cast<const T*>(&raw);
++    float v[4];
++    #pragma unroll
++    for (int i = 0; i < 4; ++i) v[i] = load_in(x, i, kRopeCode<T>);
++
++    const float rrms = rsqrtf(__builtin_fmaf(rope128_sum_sq(v), inv_d, epsilon));
++
++    float res[4];
++    if constexpr (kSplitHalf) {
++        // Both halves run the same combine with their operands swapped, so the wave
++        // evaluates it once rather than once per half.
++        const int n_pairs = rot_dim / 2;
++        const int lane = e0 / 4;
++        const bool first = e0 < n_pairs;
++        const int src = first ? lane + n_pairs / 4 : (e0 < rot_dim ? lane - n_pairs / 4 : lane);
++        #pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const float n = round_to<T>(rrms * w[i] * v[i]);
++            const float partner = __shfl(n, src, kRopeWave);
++            const float rotated = rope128_combine<T, kFCode, true>(fa[i], first ? n : partner, fb[i],
++                                                                first ? partner : n);
++            res[i] = e0 < rot_dim ? rotated : rrms * v[i] * w[i];
++        }
++    } else {
++        #pragma unroll
++        for (int i = 0; i < 4; i += 2) {
++            if (e0 + i < rot_dim) {
++                const float na = round_to<T>(rrms * w[i] * v[i]);
++                const float nb = round_to<T>(rrms * w[i + 1] * v[i + 1]);
++                res[i] = rope128_combine<T, kFCode, false>(fa[i], na, fb[i], nb);
++                res[i + 1] = rope128_combine<T, kFCode, false>(fa[i + 1], na, fb[i + 1], nb);
++            } else {
++                res[i] = rrms * v[i] * w[i];
++                res[i + 1] = rrms * v[i + 1] * w[i + 1];
++            }
++        }
++    }
++
++    alignas(8) T packed[4];
++    #pragma unroll
++    for (int i = 0; i < 4; ++i) rope_store<T>(packed, i, res[i]);
++    *reinterpret_cast<uint2*>(out) = *reinterpret_cast<const uint2*>(packed);
++}
++
++// Strides are per token (_t) and per head (_h); the launcher maps dim1/dim2 onto
++// them. sf_t and sf_b are 0 where freqs broadcasts. q and q_out may be the same
++// buffer (in place): every row is read before it is written, so they are not
++// __restrict__. k's rows follow q's in a second pass.
++template <typename T, int kFCode, bool kSplitHalf>
++__global__ __launch_bounds__(kRope128Waves* kRopeWave) void rms_rope128_kernel(
++    const T* q, const T* k, const void* __restrict__ freqs, const void* __restrict__ q_scale,
++    const void* __restrict__ k_scale, T* q_out, T* k_out, int64_t tokens, int64_t other,
++    int heads, int head_dim, int rot_dim, int64_t sx_b, int64_t sx_t, int64_t sx_h,
++    int64_t so_b, int64_t so_t, int64_t so_h, int64_t sf_b, int64_t sf_t, int64_t sf_d,
++    int64_t sf_rot, int64_t sf_pair, int s_code, float epsilon) {
++
++    const int64_t token = static_cast<int64_t>(blockIdx.x) * kRope128Waves + threadIdx.x / kRopeWave;
++    if (token >= tokens) return;
++    const int64_t b = token / other;
++    const int64_t t = token - b * other;
++    const int e0 = 4 * (threadIdx.x % kRopeWave);
++
++    // rms_rope_kernel's f00/f01 feed element ia and f10/f11 element ib of a pair.
++    const int64_t foff_row = b * sf_b + t * sf_t;
++    const int n_pairs = rot_dim / 2;
++    float fa[4] = {}, fbk[4] = {};
++    #pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const int e = e0 + i;
++        if (e < rot_dim) {
++            int64_t foff;
++            if constexpr (kSplitHalf) {
++                foff = e < n_pairs ? foff_row + e * sf_d : foff_row + (e - n_pairs) * sf_d + sf_rot;
++            } else {
++                foff = foff_row + (e / 2) * sf_d + ((e & 1) ? sf_rot : 0);
++            }
++            fa[i] = load_in(freqs, foff, kFCode);
++            fbk[i] = load_in(freqs, foff + sf_pair, kFCode);
++        }
++    }
++    const float inv_d = 1.0f / static_cast<float>(head_dim);
++
++    const int passes = k != nullptr ? 2 : 1;
++    for (int pass = 0; pass < passes; ++pass) {
++        const T* x = (pass ? k : q) + b * sx_b + t * sx_t + e0;
++        T* out = (pass ? k_out : q_out) + b * so_b + t * so_t + e0;
++        const void* scale = pass ? k_scale : q_scale;
++        float w[4];
++        #pragma unroll
++        for (int i = 0; i < 4; ++i) w[i] = load_in(scale, e0 + i, s_code);
++
++        for (int h0 = 0; h0 < heads; h0 += kRope128Unroll) {
++            uint2 raw[kRope128Unroll];
++            #pragma unroll
++            for (int u = 0; u < kRope128Unroll; ++u) {
++                if (h0 + u >= heads) break;
++                raw[u] = *reinterpret_cast<const uint2*>(x + (h0 + u) * sx_h);
++            }
++            #pragma unroll
++            for (int u = 0; u < kRope128Unroll; ++u) {
++                if (h0 + u >= heads) break;
++                rope128_row<T, kFCode, kSplitHalf>(raw[u], out + (h0 + u) * so_h, w, fa, fbk, e0,
++                                                   rot_dim, inv_d, epsilon);
++            }
++        }
++    }
++}
++
+ }  // namespace comfy::hip_backend
+ 
+ extern "C" void launch_rms_rope_kernel(
+@@ -155,6 +344,59 @@ extern "C" void launch_rms_rope_kernel(
+         throw std::runtime_error("rms_rope: rot_dim must be even and <= head_dim");
+     }
+ 
++    // The fast path loops a wave over the heads of one token, so the head axis has
++    // to be one freqs broadcasts over; it reads rows 8 bytes at a time, so they have
++    // to be dense and 8-byte aligned; split-half pairs have to start at the same
++    // offset in their lanes.
++    const auto aligned_stride = [](int64_t extent, int64_t stride) {
++        return extent == 1 || stride % 4 == 0;
++    };
++    const uintptr_t ptrs = reinterpret_cast<uintptr_t>(q) | reinterpret_cast<uintptr_t>(k) |
++                           reinterpret_cast<uintptr_t>(q_out) | reinterpret_cast<uintptr_t>(k_out);
++    const bool in_d1 = fd1 == 1 && (fd2 != 1 || dim1 > 1);
++    const int64_t heads = in_d1 ? dim1 : dim2;
++    if (head_dim == 128 && (x_code == 1 || x_code == 2) && sx_d == 1 && so_d == 1 &&
++        (fd1 == 1 || fd2 == 1) && heads <= 0x7fffffff && (!split_half || rot % 8 == 0) &&
++        (ptrs & 7u) == 0 && aligned_stride(batch, sx_b) && aligned_stride(dim1, sx_d1) &&
++        aligned_stride(dim2, sx_d2) && aligned_stride(batch, so_b) &&
++        aligned_stride(dim1, so_d1) && aligned_stride(dim2, so_d2)) {
++        const int64_t other = in_d1 ? dim2 : dim1;
++        const int64_t tokens = batch * other;
++        const int64_t blocks = (tokens + kRope128Waves - 1) / kRope128Waves;
++        const int64_t sf_t = in_d1 ? (fd2 == 1 ? 0 : sf_d2) : (fd1 == 1 ? 0 : sf_d1);
++#define CK_RMS_ROPE128_LAUNCH(T, F, SPLIT)                                                     \
++    rms_rope128_kernel<T, F, SPLIT><<<static_cast<unsigned int>(blocks),                       \
++                                      kRope128Waves * kRopeWave, 0, stream>>>(                 \
++        static_cast<const T*>(q), static_cast<const T*>(k), freqs, q_scale, k_scale,           \
++        static_cast<T*>(q_out), static_cast<T*>(k_out), tokens, other,                         \
++        static_cast<int>(heads), static_cast<int>(head_dim), static_cast<int>(rot), sx_b,      \
++        in_d1 ? sx_d2 : sx_d1, in_d1 ? sx_d1 : sx_d2, so_b, in_d1 ? so_d2 : so_d1,             \
++        in_d1 ? so_d1 : so_d2, fb == 1 ? 0 : sf_b, sf_t, sf_d, sf_rot, sf_pair, s_code, epsilon)
++#define CK_RMS_ROPE128_SPLIT(T, F)               \
++    if (split_half) {                            \
++        CK_RMS_ROPE128_LAUNCH(T, F, true);       \
++    } else {                                     \
++        CK_RMS_ROPE128_LAUNCH(T, F, false);      \
++    }
++#define CK_RMS_ROPE128_FREQS(T)                  \
++    if (f_code == 0) {                           \
++        CK_RMS_ROPE128_SPLIT(T, 0)               \
++    } else if (f_code == 1) {                    \
++        CK_RMS_ROPE128_SPLIT(T, 1)               \
++    } else {                                     \
++        CK_RMS_ROPE128_SPLIT(T, 2)               \
++    }
++        if (x_code == 2) {
++            CK_RMS_ROPE128_FREQS(__bf16)
++        } else {
++            CK_RMS_ROPE128_FREQS(__half)
++        }
++#undef CK_RMS_ROPE128_FREQS
++#undef CK_RMS_ROPE128_SPLIT
++#undef CK_RMS_ROPE128_LAUNCH
++        return;
++    }
++
+ #define CK_RMS_ROPE_LAUNCH(T)                                                                  \
+     rms_rope_kernel<T><<<static_cast<unsigned int>(rows), kRmsRopeThreads, 0, stream>>>(       \
+         q, k, freqs, q_scale, k_scale, static_cast<T*>(q_out), static_cast<T*>(k_out), dim1,   \
+-- 
+2.43.0
+

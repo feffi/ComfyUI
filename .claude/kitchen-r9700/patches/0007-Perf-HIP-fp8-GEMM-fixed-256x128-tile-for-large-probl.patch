@@ -1,0 +1,44 @@
+From 76e0ce2758b629682157fe3b66c64e3e14c9fb60 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 8 Oct 2026 11:18:02 +0000
+Subject: [PATCH 7/7] [Perf][HIP] fp8 GEMM: fixed 256x128 tile for large
+ problems
+
+For K >= 4096 and at least eight 256x128 blocks per WGP, launch a
+256x128x128 tile with 16 waves (32x64 per wave) instead of
+launch_gemm_wmma's 128x128: each B tile serves twice the rows, a quarter
+fewer tile loads per MMA. Swept on the R9700 against the other tiles, it
+was the fastest for Krea 2's GEMMs at M = 10264. The choice is a fixed
+rule, and the tile only changes scheduling: every output gets the same WMMA
+K-steps in the same order, so results are bit-identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014FGDV3n1PG2QWogzESLcaZ
+---
+ comfy_kitchen/backends/hip/ops/gemm_fp8.hip | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/comfy_kitchen/backends/hip/ops/gemm_fp8.hip b/comfy_kitchen/backends/hip/ops/gemm_fp8.hip
+index 44fcbf2..a6e2fa2 100644
+--- a/comfy_kitchen/backends/hip/ops/gemm_fp8.hip
++++ b/comfy_kitchen/backends/hip/ops/gemm_fp8.hip
+@@ -63,6 +63,16 @@ static void launch_fp8(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N
+         gemv_fp8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, epi);
+         return;
+     }
++    // With blocks to spare, a 256x128 tile of 16 waves reads each B tile for twice
++    // the rows. On the R9700 it was the fastest tile for Krea 2's GEMMs at
++    // M = 10264. The tile only changes scheduling: every output still gets the same
++    // WMMA K-steps in the same order.
++    const int blocks_256 = ((M + 255) / 256) * ((N + 127) / 128);
++    if (K >= 4096 && blocks_256 >= 8 * device_wgp_count()) {
++        launch_gemm_tile<MmaFp8, EpiTensorwise, OutT, 256, 128, 128, 8, 2, 2, 4>(
++            A, B, C, M, N, K, N, epi, stream);
++        return;
++    }
+     launch_gemm_wmma<MmaFp8, EpiTensorwise, OutT>(A, B, C, M, N, K, N, epi, stream);
+ }
+ 
+-- 
+2.43.0
+

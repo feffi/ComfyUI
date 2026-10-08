@@ -1,6 +1,6 @@
 #!/bin/bash
 # usage: suite.sh <binary> <dump dir>; cases cover every launch_gemm_wmma path, the
-# GEMV, partial M/N tiles and K tails. Fields: M N K out bias seed wgps
+# GEMV, partial M/N tiles, K tails and (last three) the 256x128 tile of patch 0007. Fields: M N K out bias seed wgps
 BIN=$1; D=$2; mkdir -p $D; fail=0
 while read M N K O B S W; do
   [ -z "$M" ] && continue
@@ -23,5 +23,8 @@ done <<'CASES'
 40 100 2048 2 -1 12 32
 70 40 256 0 2 13 32
 129 129 128 2 2 14 1
+600 400 4096 2 2 21 1
+520 300 4112 1 -1 22 1
+1024 256 4096 0 0 23 1
 CASES
 exit $fail

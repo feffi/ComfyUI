@@ -22,7 +22,10 @@
 typedef void* hipStream_t;
 typedef int hipError_t;
 constexpr int hipSuccess = 0;
-enum { hipDeviceAttributeMultiprocessorCount = 1 };
+enum { hipDeviceAttributeMultiprocessorCount = 1, hipDeviceAttributeMaxSharedMemoryPerBlock = 2 };
+enum { hipFuncAttributeMaxDynamicSharedMemorySize = 8 };
+inline hipError_t hipFuncSetAttribute(const void*, int, int) { return 0; }
+inline hipError_t hipGetLastError() { return 0; }
 
 struct dim3 {
     unsigned x, y, z;
@@ -114,6 +117,45 @@ template <typename C> C emu_unsupported(C c) { abort(); return c; }
 #define __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c) emu_unsupported(c)
 inline void __syncthreads() { emu::block_bar->arrive_and_wait(); }
 template <typename T> T __shfl_xor(T v, int off, int = 32) { return emu::shfl_xor(v, off); }
+namespace emu {
+template <typename T> T shfl_idx(T v, int src) {
+    auto& s = slots[wave];
+    memcpy(s.raw[lane], &v, sizeof(T));
+    wave_sync();
+    T r;
+    memcpy(&r, s.raw[src & 31], sizeof(T));
+    wave_sync();
+    return r;
+}
+}
+template <typename T> T __shfl(T v, int src, int = 32) { return emu::shfl_idx(v, src); }
+namespace emu {
+inline int dpp_xmask_src(int ctrl) {
+    if (ctrl < 0x160 || ctrl > 0x16f) abort();  // only row_xmask is modelled
+    return lane ^ (ctrl - 0x160);
+}
+inline int permlanex16_src(unsigned s0, unsigned s1) {
+    if (s0 != 0x76543210u || s1 != 0xfedcba98u) abort();  // only the identity selects
+    return lane ^ 16;
+}
+}
+#include <mutex>
+#include <unordered_map>
+namespace emu {
+// fp32 value each output element held before its narrowing store, keyed by address.
+inline std::mutex shadow_mu;
+inline std::unordered_map<uintptr_t, float> shadow;
+template <typename P>
+inline void rec(P* p, int64_t i, float v) {
+    std::lock_guard<std::mutex> g(shadow_mu);
+    shadow[reinterpret_cast<uintptr_t>(p + i)] = v;
+}
+}
+#define __builtin_amdgcn_update_dpp(old, src, ctrl, rm, bm, bc) emu::shfl_idx((src), emu::dpp_xmask_src(ctrl))
+#define __builtin_amdgcn_permlanex16(old, src, s0, s1, fi, bc) emu::shfl_idx((src), emu::permlanex16_src((s0), (s1)))
+#define __builtin_amdgcn_readlane(v, l) emu::shfl_idx((v), (l))
+template <typename T> T __shfl_down(T v, unsigned off, int = 32) { return emu::shfl_idx(v, (emu::lane + (int)off) < 32 ? emu::lane + (int)off : emu::lane); }
+inline float rsqrtf(float x) { return 1.0f / std::sqrt(x); }
 
 typedef int* hipEvent_t;
 enum hipStreamCaptureStatus { hipStreamCaptureStatusNone = 0, hipStreamCaptureStatusActive = 1 };

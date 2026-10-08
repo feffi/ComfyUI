@@ -17,3 +17,10 @@ extern "C" __attribute__((device, always_inline)) inline size_t __ockl_get_num_g
     const uint32_t* p = (const uint32_t*)__builtin_amdgcn_implicitarg_ptr();
     return p[d];
 }
+// ocml's f32 rsqrt with denormals on, as the shipped kernels inline it: a denormal
+// input is scaled by 2^24 and the result by 2^12.
+extern "C" __attribute__((device, always_inline)) inline float __ocml_rsqrt_f32(float x) {
+    const bool s = x < 0x1p-126f;
+    const float r = __builtin_amdgcn_rsqf(s ? x * 0x1p+24f : x);
+    return s ? r * 0x1p+12f : r;
+}
