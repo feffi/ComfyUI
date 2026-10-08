@@ -110,6 +110,11 @@ kitchen update:
     rms_rope products; read off its ISA), and records the fp32 value of every element
     before its bf16/fp16 store. That second check matters: in a negative control, a
     swapped fma changed 30 % of the fp32 values but only 2-15 output elements per case.
+  - fp8 quantize: `quant_fp8.py <kitchen backends/hip dir>` compiles kitchen's
+    per-tensor encoder for the host and compares it with torch's clamp-then-cast over
+    every bf16 and fp16 value and every positive float32 in [2^-10, 2^9], with log2
+    nudged by up to ±16 ulp. ComfyUI `c028067` relies on that identity. A
+    round-half-away encoder fails it with 126 bf16 mismatches.
 - `kinfo.py`: per-kernel VGPRs, LDS and the instruction mix of the WMMA K-loop from a
   `clang -S` file; `build.sh` compiles a kitchen source for one gfx target with
   clang 20 and HIP headers, `ockl_shim.h` inlines the work-item queries and the f32

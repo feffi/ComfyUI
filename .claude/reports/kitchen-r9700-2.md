@@ -122,20 +122,35 @@ could justify without a measurement.
   size and pass count and still runs at the K = 6144 rate (209 TOP/s).
 - **Question.** By 2·M·N·K, 10.2 ms is ~203 TOP/s, not 193; which number is right?
   And does the 10.2 ms include quantizing the 10264 x 16384 bf16 activation to fp8?
-  With `fp8_e4m3fn_fast` weights that quantize is not kitchen's: `fp8_linear` in
-  ComfyUI's `comfy/ops.py` clamps the input in place and casts it with torch, two
-  kernels and ~1.2 GB of traffic for this input (~2 ms at 600 GB/s). Kitchen's
-  quantize would move ~0.5 GB (~0.85 ms). Without the quantize the GEMM would be
-  ~8.2-9.3 ms, at or above the other shapes' rate, and the lever would be the quantize.
-- **Lead, not done: the activation quantize per block.** Every fp8 Linear quantizes
-  its own input in `fp8_linear`, so wq, wk, wv and the attention gate quantize the
-  same normed input four times, and the MLP gate and up twice. Per Krea 2 block at
-  10264 tokens that is ~4.3 GB of torch clamp and cast traffic, ~7 ms at 600 GB/s
-  next to 42.78 ms of fp8 GEMMs (estimate from the code, not timed). Kitchen's
-  quantize would make it ~1.8 GB (~3 ms), and quantizing each shared input once
-  ~1.1 GB (~1.8 ms). That is a ComfyUI change in `fp8_linear`, outside these
-  patches; phase 7 of the measurement prompt times both quantize paths and its
-  kernel profile shows the clamp and cast kernels.
+  With `fp8_e4m3fn_fast` weights that quantize was not kitchen's when you timed it:
+  `fp8_linear` in ComfyUI's `comfy/ops.py` clamped the input in place and cast it with
+  torch, two kernels and ~1.2 GB of traffic for this input (~2 ms at 600 GB/s).
+  ComfyUI `c028067` (below) uses kitchen's quantize, ~0.5 GB (~0.85 ms). Without the
+  quantize the GEMM would be ~8.2-9.3 ms, at or above the other shapes' rate, and the
+  lever would be the quantize.
+- **The activation quantize per block: half done in ComfyUI.** Every fp8 Linear
+  quantizes its own input in `fp8_linear`, so wq, wk, wv and the attention gate
+  quantize the same normed input four times, and the MLP gate and up twice. Per
+  Krea 2 block at 10264 tokens that was ~4.3 GB of torch clamp and cast traffic,
+  ~7 ms at 600 GB/s next to 42.78 ms of fp8 GEMMs (estimate from the code, not timed).
+  ComfyUI `c028067` switches `fp8_linear` to kitchen's quantize (`QuantizedTensor.from_float`):
+  ~1.8 GB (~3 ms) per block, about 0.1 s per 28-block forward. `b356f6f` fixes a
+  regression in it: inputs that require grad must keep taking the plain linear.
+  Quantizing each shared input once (~1.1 GB, ~1.8 ms) is still open and needs a
+  change in the model code.
+  - **Identity.** Kitchen's HIP encoder (`pack_fp8` in `fp8_utils.h`, unchanged since
+    0.2.36) gives torch's clamp-then-cast bytes for every bf16 and fp16 value and
+    every positive float32 in [2^-10, 2^9], also with its log2 off by up to ±16 ulp,
+    which covers the device's approximate `v_log_f32` (CPU emulation,
+    `tools/emu/quant_fp8.py`; a round-half-away encoder fails it with 126 bf16
+    mismatches). NaN stays NaN; only kitchen's CUDA backend turns it into -448.
+    ComfyUI's old and new `fp8_linear` give bitwise identical outputs on CPU.
+  - **Caveat.** The gain needs kitchen's GPU backend. On its eager fallback (NVIDIA
+    torch below cu130, devices without a kitchen GPU backend) the quantize adds a
+    multiply pass, ~5.5x instead of ~3.5x the input bytes.
+  - Phase 1 of the measurement prompt runs the pair's unit test on the R9700 and
+    renders Krea 2 and Qwen 2.1 with and without it; phase 7 times both quantize
+    kernels and counts kitchen's quantize launches against the fp8 GEMMs.
 - **If the GEMM alone is that slow,** the next bit-identical experiments are:
   1. Sweep the block-order group size (kGroupM 4 -> 8/16) to keep B's working set in
      MALL.
@@ -165,6 +180,8 @@ single-patch builds, and the build is checked for any timing-based choice left.
 ## Not verified
 
 - Any timing.
+- Kitchen's quantize on the GPU. The identity above emulates its source; phase 1a's
+  unit test runs the real kernel on the R9700.
 - The Windows host build of 0005-0007. They change no build files, and the device
   code compiles with clang 20 for gfx1201, gfx1100 and gfx1030.
 - The emulator's model of the shipped rounding comes from reading the bf16 and fp16
