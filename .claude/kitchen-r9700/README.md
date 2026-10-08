@@ -27,8 +27,7 @@ Never install into `.venv-rocm-100`. Everything below lives under `C:\kt`.
    git clone https://github.com/Comfy-Org/comfy-kitchen C:\kt\comfy-kitchen
    git -C C:\kt\comfy-kitchen checkout -b r9700 888b13e2c0e721f6576fe351a2ad79894b1c451f
    cd C:\kt\comfy-kitchen
-   $p = "<ComfyUI>\.claude\kitchen-r9700\patches"
-   git am "$p\0001-*.patch" "$p\0002-*.patch" "$p\0005-*.patch" "$p\0006-*.patch" "$p\0007-*.patch"
+   git am (Get-ChildItem <ComfyUI>\.claude\kitchen-r9700\patches\000[12567]-*.patch).FullName
    ```
 2. Compiler: the ROCm clang of the same SDK version as the production torch. Check
    whether the production venv already carries it (read only):
@@ -54,9 +53,9 @@ Never install into `.venv-rocm-100`. Everything below lives under `C:\kt`.
    cd C:\kt\comfy-kitchen
    C:\kt\buildenv\Scripts\python -m pip wheel . --no-deps -w dist
    ```
-5. Install it next to, not into, the production venv:
+5. Install it next to, not into, the production venv (PowerShell passes `*` to git and pip unexpanded, hence `Get-ChildItem`):
    ```
-   C:\kt\buildenv\Scripts\python -m pip install --no-deps --target C:\kt\kitchen-patched dist\comfy_kitchen-0.2.36-*.whl
+   C:\kt\buildenv\Scripts\python -m pip install --no-deps --target C:\kt\kitchen-patched (Get-ChildItem dist\comfy_kitchen-0.2.36-*.whl).FullName
    ```
    A process started with `$env:PYTHONPATH = "C:\kt\kitchen-patched"` imports the
    patched build ahead of the installed one; everything else keeps 0.2.36. The

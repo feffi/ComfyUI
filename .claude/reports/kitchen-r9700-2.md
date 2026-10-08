@@ -121,9 +121,20 @@ could justify without a measurement.
   size and pass count and still runs at the K = 6144 rate (209 TOP/s).
 - **Question.** By 2·M·N·K, 10.2 ms is ~203 TOP/s, not 193; which number is right?
   And does the 10.2 ms include quantizing the 10264 x 16384 bf16 activation to fp8?
-  That is 336 MB read and 168 MB written, ~0.85-0.9 ms at 560-600 GB/s. Without it
-  the GEMM would be ~9.3 ms ≈ 222 TOP/s, in line with the other shapes, and the lever
-  would be fusing that quantize into the SwiGLU, not the GEMM.
+  With `fp8_e4m3fn_fast` weights that quantize is not kitchen's: `fp8_linear` in
+  ComfyUI's `comfy/ops.py` clamps the input in place and casts it with torch, two
+  kernels and ~1.2 GB of traffic for this input (~2 ms at 600 GB/s). Kitchen's
+  quantize would move ~0.5 GB (~0.85 ms). Without the quantize the GEMM would be
+  ~8.2-9.3 ms, at or above the other shapes' rate, and the lever would be the quantize.
+- **Lead, not done: the activation quantize per block.** Every fp8 Linear quantizes
+  its own input in `fp8_linear`, so wq, wk, wv and the attention gate quantize the
+  same normed input four times, and the MLP gate and up twice. Per Krea 2 block at
+  10264 tokens that is ~4.3 GB of torch clamp and cast traffic, ~7 ms at 600 GB/s
+  next to 42.78 ms of fp8 GEMMs (estimate from the code, not timed). Kitchen's
+  quantize would make it ~1.8 GB (~3 ms), and quantizing each shared input once
+  ~1.1 GB (~1.8 ms). That is a ComfyUI change in `fp8_linear`, outside these
+  patches; phase 7 of the measurement prompt times both quantize paths and its
+  kernel profile shows the clamp and cast kernels.
 - **If the GEMM alone is that slow,** the next bit-identical experiments are:
   1. Sweep the block-order group size (kGroupM 4 -> 8/16) to keep B's working set in
      MALL.
@@ -134,6 +145,19 @@ could justify without a measurement.
   per block: an unpadded 128x128x128 with an XOR swizzle fits exactly, at 2 blocks per
   WGP instead of 3. Not started; it is a structural change to the shared GEMM core,
   so it needs the bench first.
+
+## How it gets measured
+
+Phase 7 of `.claude/prompts/r9700-measurement-run.md` builds 0001 + 0002 + 0005-0007
+and compares it with the installed kitchen through the three scripts. Two candidate
+runs in separate processes must also match each other (restart identity). It then runs
+Krea 2, Qwen-Image 2.1 and H3 end to end, twice per build, each in a fresh instance,
+and counts the new and old kernels in one profiled step per workload. That count is
+what shows the model calls reach the fast paths, which the `fast` column cannot: it
+re-implements the launcher test on the bench's own inputs. If production rounds its
+old kernels differently from the official 0.2.36 wheel, the fast-path rows match that
+wheel instead; phase 7 then marks the patch inconclusive, since it would change
+production renders once.
 
 ## Not verified
 
