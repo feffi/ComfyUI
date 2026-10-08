@@ -134,23 +134,24 @@ could justify without a measurement.
   Krea 2 block at 10264 tokens that was ~4.3 GB of torch clamp and cast traffic,
   ~7 ms at 600 GB/s next to 42.78 ms of fp8 GEMMs (estimate from the code, not timed).
   ComfyUI `c028067` switches `fp8_linear` to kitchen's quantize (`QuantizedTensor.from_float`):
-  ~1.8 GB (~3 ms) per block, about 0.1 s per 28-block forward. `b356f6f` fixes a
+  ~1.8 GB (~3 ms) per block, about 0.1 s less per 28-block forward. `b356f6f` fixes a
   regression in it: inputs that require grad must keep taking the plain linear.
   Quantizing each shared input once (~1.1 GB, ~1.8 ms) is still open and needs a
   change in the model code.
   - **Identity.** Kitchen's HIP encoder (`pack_fp8` in `fp8_utils.h`, unchanged since
-    0.2.36) gives torch's clamp-then-cast bytes for every bf16 and fp16 value and
-    every positive float32 in [2^-10, 2^9], also with its log2 off by up to ±16 ulp,
+    0.2.36) gives torch's clamp-then-cast bytes for every non-NaN bf16 and fp16 value
+    and every positive float32 in [2^-10, 2^9], also with its log2 off by up to ±16 ulp,
     which covers the device's approximate `v_log_f32` (CPU emulation,
     `tools/emu/quant_fp8.py`; a round-half-away encoder fails it with 126 bf16
-    mismatches). NaN stays NaN; only kitchen's CUDA backend turns it into -448.
+    mismatches). NaN stays NaN on the HIP and eager backends. Kitchen's CUDA backend
+    turns it into -448, its opt-in Triton backend into +448.
     ComfyUI's old and new `fp8_linear` give bitwise identical outputs on CPU.
   - **Caveat.** The gain needs kitchen's GPU backend. On its eager fallback (NVIDIA
     torch below cu130, devices without a kitchen GPU backend) the quantize adds a
     multiply pass, ~5.5x instead of ~3.5x the input bytes.
   - Phase 1 of the measurement prompt runs the pair's unit test on the R9700 and
     renders Krea 2 and Qwen 2.1 with and without it; phase 7 times both quantize
-    kernels and counts kitchen's quantize launches against the fp8 GEMMs.
+    paths and counts kitchen's quantize launches against the fp8 GEMMs.
 - **If the GEMM alone is that slow,** the next bit-identical experiments are:
   1. Sweep the block-order group size (kGroupM 4 -> 8/16) to keep B's working set in
      MALL.

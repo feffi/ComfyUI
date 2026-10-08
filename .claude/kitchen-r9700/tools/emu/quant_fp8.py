@@ -1,17 +1,11 @@
 # ruff: noqa: T201
-"""Kitchen's HIP fp8 quantize against torch's clamp-then-cast, on the CPU.
-
-ComfyUI's fp8_linear quantizes with QuantizedTensor.from_float (c028067), which on
-the R9700 runs kitchen's quantize_per_tensor_fp8 kernel. Before, it clamped to
-+-448 and cast with torch. This compiles that kernel's encoder for the host and
-compares the two over every bf16 and fp16 bit pattern and every positive float32 in
-[2^-10, 2^9] (below, both give a signed zero; above, both saturate), with the
-log2f result nudged by up to +-16 ulps.
-
-    python quant_fp8.py <kitchen>/comfy_kitchen/backends/hip
-
-Expected: 0 mismatches outside NaN. Kitchen keeps a NaN's sign; torch's CPU clamp
-may not, so some bf16 NaNs differ in the sign bit only (NaN either way).
+"""Compare kitchen's HIP per-tensor fp8 encoder (pack_fp8, compiled for the host) with
+torch's clamp-then-cast over every bf16 and fp16 bit pattern and every positive float32
+in [2^-10, 2^9], with log2f nudged by up to +-16 ulps. Below that range both give a
+signed zero, above it both saturate.
+usage: quant_fp8.py <kitchen>/comfy_kitchen/backends/hip
+Expected: 0 mismatches outside NaN. Kitchen keeps a NaN's sign and torch's vectorized
+CPU clamp sets it for bf16, so the 127 positive bf16 NaNs differ in the sign bit only.
 """
 
 import os
@@ -48,9 +42,11 @@ def main():
         for ulps in ULPS:
             for name, dtype in (("bf16", torch.bfloat16), ("fp16", torch.float16)):
                 x = bits.view(dtype)
-                bad = run(exe, out, name, ulps, 0, 65536) != torch_ref(x)
-                print(f"ulps {ulps:+3d} {name}: {int((bad & ~x.isnan()).sum())} mismatches of 65536, "
-                      f"{int((bad & x.isnan()).sum())} NaNs differing in the sign bit")
+                got, want = run(exe, out, name, ulps, 0, 65536), torch_ref(x)
+                bad, nan = got != want, x.isnan()
+                print(f"ulps {ulps:+3d} {name}: {int((bad & ~nan).sum())} mismatches of 65536, "
+                      f"{int((bad & nan & ((got ^ want) == 0x80)).sum())} NaNs differing in the sign bit only, "
+                      f"{int((bad & nan & ((got ^ want) != 0x80)).sum())} otherwise")
             bad = 0
             for first in range(FP32_FIRST, FP32_END, CHUNK):
                 n = min(CHUNK, FP32_END - first)
