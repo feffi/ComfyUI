@@ -158,7 +158,9 @@ what shows the model calls reach the fast paths, which the `fast` column cannot:
 re-implements the launcher test on the bench's own inputs. If production rounds its
 old kernels differently from the official 0.2.36 wheel, the fast-path rows match that
 wheel instead; phase 7 then marks the patch inconclusive, since it would change
-production renders once.
+production renders once. A patch is kept only if it is also measurably faster on the
+rows it serves; an end-to-end difference the benches miss is traced to one patch with
+single-patch builds, and the build is checked for any timing-based choice left.
 
 ## Not verified
 
