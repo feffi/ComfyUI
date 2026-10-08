@@ -875,12 +875,7 @@ def fp8_linear(self, input):
         return None
     lora_compute_dtype=comfy.model_management.lora_compute_dtype(input.device)
     scale_weight = torch.ones((), device=input.device, dtype=torch.float32)
-
-    scale_input = torch.ones((), device=input.device, dtype=torch.float32)
-    input = torch.clamp(input, min=-448, max=448, out=input)
-    input_fp8 = input.to(dtype).contiguous()
-    layout_params_input = TensorCoreFP8Layout.Params(scale=scale_input, orig_dtype=input_dtype, orig_shape=tuple(input_fp8.shape))
-    quantized_input = QuantizedTensor(input_fp8, "TensorCoreFP8Layout", layout_params_input)
+    quantized_input = QuantizedTensor.from_float(input, "TensorCoreFP8Layout")
 
     with CastBiasWeightContext(self, input, dtype=dtype, bias_dtype=input_dtype, offloadable=True, compute_dtype=lora_compute_dtype, want_requant=True) as (w, bias):
         # Wrap weight in QuantizedTensor - this enables unified dispatch
