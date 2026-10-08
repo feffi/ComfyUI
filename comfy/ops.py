@@ -871,7 +871,8 @@ def fp8_linear(self, input):
     if tensor_3d:
         input = input.reshape(-1, input_shape[2])
 
-    if input.ndim != 2:
+    # QuantizedTensor carries no autograd, so training inputs take the plain linear.
+    if input.ndim != 2 or input.requires_grad:
         return None
     lora_compute_dtype=comfy.model_management.lora_compute_dtype(input.device)
     scale_weight = torch.ones((), device=input.device, dtype=torch.float32)
