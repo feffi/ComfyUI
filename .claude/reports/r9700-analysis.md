@@ -103,18 +103,30 @@ git cherry-pick b09048c 37b7bce   # regression tests only, no runtime change
 
 The equivalence tests (round trip, fused vs unfused, upsample vs transposed conv) also pass on the old code; they guard later changes, not the original bugs. Not covered: `e9c38f9` (needs two devices), `e997bcb` (runs at `model_management` import), the sparse attention part of `d0e865c` (rejects non-CUDA tensors first; phase 1b of the measurement prompt checks it on the R9700), and the fork-only HIP commits `85d2562`, `da79103`, `84cfd41`. The measurement prompt (phase 1a) runs the tests on the R9700 against both builds; the baseline run is the on-hardware evidence for `d7b3369`.
 
-### comfy-kitchen patches (fp8 GEMM)
+### comfy-kitchen patches
 
-The local session adopted the branch on 04.10.2026 (Krea 2 at 1280x2048, cfg 1.8: 183 s -> 77 s warm, together with fp8_e4m3fn_fast weights, SageAttention-RDNA4 and a res_2m refine) and measured kitchen's fp8 GEMM against hipBLASLt: 10-20 % slower for K <= 6144, 35-42 % faster for K = 16384, 47.0 ms per Krea 2 block vs 49.9 (hipBLASLt untuned) and 40.9 (TunableOp), and 5x slower at M ~ 2 (0.55 vs 0.11 ms). Four patches against kitchen v0.2.36 (`888b13e`, they also apply to v0.2.37) answer that. Nothing was timed here; details in `.claude/reports/kitchen-r9700.md`, patches, benchmark and Windows build steps in `.claude/kitchen-r9700/`.
+**Round 1 (fp8 GEMM).** The local session adopted the branch on 04.10.2026 (Krea 2 at 1280x2048, cfg 1.8: 183 s -> 77 s warm, together with fp8_e4m3fn_fast weights, SageAttention-RDNA4 and a res_2m refine) and measured kitchen's fp8 GEMM against hipBLASLt: 10-20 % slower for K <= 6144, 35-42 % faster for K = 16384, 47.0 ms per Krea 2 block vs 49.9 (hipBLASLt untuned) and 40.9 (TunableOp), and 5x slower at M ~ 2 (0.55 vs 0.11 ms). Four patches against kitchen v0.2.36 (`888b13e`, they also apply to v0.2.37) answer that. Nothing was timed here; details in `.claude/reports/kitchen-r9700.md`, patches, benchmark and Windows build steps in `.claude/kitchen-r9700/`.
 
-| Patch | Change | Output | Expected |
+| Patch | Change | Output | Expected | Measured (local session) |
+|---|---|---|---|---|
+| 0001 | WMMA GEMM core: tile loads without exec-masked branches and coalesced to whole 128-byte lines; the K-tail test only in kernels whose K is not a multiple of BKB | bit-identical | per K tile and wave 45 VALU, 42 SALU, 11 branches -> 24, 8, 3; a few % at large M; shared by the int8, int4 and fp16 GEMMs | byte-identical; **kept**, with 0002 in production as 0.2.36+r9700: Krea 2 block fp8 GEMMs 45.46 -> 42.78 ms |
+| 0002 | fp8 GEMV (M <= 8): `v_cvt_pk_f32_fp8` decode instead of ~650 VALU per 16 bytes, all rows per wave so the weight is read once | bit-identical | M ~ 2, K 4096, N 16384: 0.55 ms -> towards the 0.10 ms bandwidth floor | byte-identical; **kept**: M = 1/2/8 from 0.23/0.40/1.48 to 0.08/0.08/0.18 ms |
+| 0003 | six more tiles (64x64 wave tiles: a third fewer LDS reads per MMA; 16/32-row tiles for small M) and a measured tile choice per shape class instead of fixed thresholds | bit-identical | 0 to ~15 % at K <= 6144; first GEMM per class pays ~0.2-0.4 s of tuning; `COMFY_KITCHEN_HIP_FP8_TUNE=0` restores 0.2.36 | byte-identical; **dropped**: tiles gain only 1-3 % (256x128x128 best at M = 10264), and the tuner's timing is noise (it picked a tile 40-70 % slower at M = 77) |
+| 0004 | draft: hardware e4m3 encode (`v_cvt_pk_fp8_f32`) in the per-tensor quantize | **unverified** | quantize from VALU-bound towards memory-bound | byte-identical; **dropped**: no gain, the quantize is already memory-bound at 560-600 GB/s |
+
+0001-0003 feed every output the same WMMA K-steps in the same order; a CPU emulation of kitchen's kernel source showed 0 differing bytes against v0.2.36 in 17 cases, and the R9700 confirmed it for all four patches.
+
+**Round 2 (norms, rope, fixed GEMM tile).** The local session then set a harder rule: renders must be bit-identical across process restarts, so no timing-based choices at run time and no reduction order that depends on scheduling or atomics. Targets in its order: `rms_rope` (Krea 2: 1.59 ms per q+k call, ~200 GB/s against a practical ~600), `rms_adaln` (0.85 ms per call, ~300 GB/s), and the remaining fp8 GEMM gap. Three patches on top of 0001 + 0002; details in `.claude/reports/kitchen-r9700-2.md`, benchmarks in `.claude/kitchen-r9700/`.
+
+| Patch | Change | Output | Expected (Krea 2 at 1280x2048) |
 |---|---|---|---|
-| 0001 | WMMA GEMM core: tile loads without exec-masked branches and coalesced to whole 128-byte lines; the K-tail test only in kernels whose K is not a multiple of BKB | bit-identical | per K tile and wave 45 VALU, 42 SALU, 11 branches -> 24, 8, 3; a few % at large M; shared by the int8, int4 and fp16 GEMMs |
-| 0002 | fp8 GEMV (M <= 8): `v_cvt_pk_f32_fp8` decode instead of ~650 VALU per 16 bytes, all rows per wave so the weight is read once | bit-identical | M ~ 2, K 4096, N 16384: 0.55 ms -> towards the 0.10 ms bandwidth floor |
-| 0003 | six more tiles (64x64 wave tiles: a third fewer LDS reads per MMA; 16/32-row tiles for small M) and a measured tile choice per shape class instead of fixed thresholds | bit-identical | 0 to ~15 % at K <= 6144; first GEMM per class pays ~0.2-0.4 s of tuning; `COMFY_KITCHEN_HIP_FP8_TUNE=0` restores 0.2.36 |
-| 0004 | draft: hardware e4m3 encode (`v_cvt_pk_fp8_f32`) in the per-tensor quantize | **unverified** | quantize from VALU-bound towards memory-bound |
+| 0005 | `rms_adaln` / `adaln`: one wave per row with 16-byte accesses, for 2-byte rows with D % 256 == 0 | bit-identical | 0.85 -> ~0.45 ms per call, 2 calls per block |
+| 0006 | `rms_rope`, head_dim 128: one wave per token, freqs and weights loaded once, looping over the token's heads; DPP instead of LDS for the row sums | bit-identical | 1.59 -> ~0.6 ms per q+k call; MiniMax H3 at 39.5k tokens ~3.8-4 ms per call |
+| 0007 | fp8 GEMM: fixed 256x128x128 tile when K >= 4096 and the grid has at least 8 blocks per WGP | bit-identical | 1-3 % on the large GEMMs (the local session's tile sweep) |
 
-0001-0003 feed every output the same WMMA K-steps in the same order. A CPU emulation running kitchen's kernel source confirms it: 17 cases (GEMV, every tile path, K tails, partial tiles, three output dtypes, bias), 0 differing bytes against v0.2.36 for 0001, 0002, each of the 11 tiles forced and the tuned default. 0004 ships with `check_fp8_quantize.py` (every bf16 and fp16 pattern, every e4m3 midpoint) and stays out if one byte differs. Phase 7 of the measurement prompt builds the patches into a separate folder (the production venv stays untouched), runs both scripts against the installed 0.2.36, sweeps the tiles against the tuner's picks and compares Krea 2 and Qwen-Image 2.1 end to end with fp8 weights, ending in keep/drop per patch.
+That is about 50 ms per 28-block Krea 2 forward from 0005 and 0006, plus 12-36 ms from 0007. Identity was checked against the 0.2.36 code objects, not the source: their compiled `rms_rope` rounds differently from source order in four places (which square is fused into the running sum, the grouping `(rrms * w) * x`, which fp32 rotation product is fused, and the unfused add after bf16/fp16 rounding), and the fast paths write each of those steps out explicitly. A CPU emulation that records every element's fp32 value before its bf16 store found 0 differences in 1.66 M values (2.53 M output elements); a deliberately swapped fma changed 30 % of those fp32 values but only 2-15 output elements per case, so byte comparisons alone are a weak test. Not solved: the mlp down GEMM at K = 16384 (10.2 ms). DRAM re-reads of its weight do not explain it, and the 10.2 ms may include the activation quantize (~0.9 ms); phase 7 of the measurement prompt times the GEMM alone and the quantize.
+
+Phase 7 of the measurement prompt builds 0001 + 0002 + 0005-0007 into a separate folder (the production venv stays untouched) and compares it with the installed kitchen through `bench_rms_rope.py`, `bench_rms_adaln.py` and `bench_fp8_gemm.py` (`--save-ref`, then `--ref`): byte identity per row, ms and GB/s, which calls take the new paths, the K = 16384 question, and Krea 2, Qwen-Image 2.1 and H3 end to end with max abs diff 0. It ends in keep/drop per patch; round 1 is not re-measured.
 
 ### GPU checks still owed
 
@@ -131,8 +143,9 @@ The kitchen HIP kernels and multi-GPU paths behind these commits never ran here.
 | `e9c38f9` | CFG Split with cfg > 1 and batch 2: s/it (`run_placement_bench.py --cfg 4 --cfg-split`) | revert |
 | `e997bcb` | startup log on both cards still reports the expected attention line | revert |
 | `3781fb9` | only with TorchCompileModel (`tools/A5/ab_compile.py --variants baseline,torch_compile`) | none needed for eager runs |
-| kitchen 0001-0003 (prompt phase 7) | `.claude/kitchen-r9700/bench_fp8_gemm.py --ref` against the installed 0.2.36: `identical` on every shape, then ms per shape and the Krea 2 block total against 47.0 / 40.9 ms; `--sweep-tiles` to see the tuner's choices | drop the patch; for 0003 alone `COMFY_KITCHEN_HIP_FP8_TUNE=0` |
-| kitchen 0004 (prompt phase 7) | `.claude/kitchen-r9700/check_fp8_quantize.py --ref`: 0 differing bytes | leave 0004 out |
+| kitchen 0006 (prompt phase 7) | `.claude/kitchen-r9700/bench_rms_rope.py --ref` against the installed kitchen: `identical` in every row, `fast` = `qk` on the Krea 2 and H3 rows, Krea 2 near 0.6 ms per call | leave 0006 out. Exception: if only the fast-path rows differ, by about one bf16 ulp, compare against the official 0.2.36 wheel first (the production build may round its old kernel differently) |
+| kitchen 0005 (prompt phase 7) | `bench_rms_adaln.py --ref`: `identical` in every row, Krea 2 near 0.45 ms per call | leave 0005 out (same exception) |
+| kitchen 0007 (prompt phase 7) | `bench_fp8_gemm.py --ref`: `identical` on every shape, Krea 2 block total against 42.78 ms, Qwen 2.1 rows not slower | leave 0007 out |
 
 Known limits:
 - `da79103` relies on the HIP kernel accumulating in fp32. kitchen documents `fp16_conv3d` as fp16-accumulate, so this is fork-only under AGENTS.md. Re-check the disassembly when you bump comfy-kitchen.
@@ -145,7 +158,7 @@ Known limits:
 
 ### Upstream items worth filing
 
-- comfy-kitchen: the four patches above, once measured on the R9700. Still open: document per-backend accumulation (proposed text in `kitchen-r9700.md`: HIP fp16 conv/GEMM accumulate in fp32), bf16 HIP conv3d (would move Krea 2 / Qwen VAEs off torch's fallback), `sol_attn` with Lq≠Lk and native GQA (Qwen 2.1 sparse), kitchen#184 (HIP sol paired query blocks, +18–20 % on gfx1201; moot while Sage handles attention).
+- comfy-kitchen: 0001 and 0002 (measured on the R9700, kept); 0005-0007 once measured. Still open: document per-backend accumulation (proposed text in `kitchen-r9700.md`: HIP fp16 conv/GEMM accumulate in fp32), bf16 HIP conv3d (would move Krea 2 / Qwen VAEs off torch's fallback), `sol_attn` with Lq≠Lk and native GQA (Qwen 2.1 sparse), kitchen#184 (HIP sol paired query blocks, +18–20 % on gfx1201; moot while Sage handles attention).
 - PyTorch: `slow_conv_dilated` writes bias with one kernel per output channel and builds columns for 1×1 (`NaiveDilatedConvolution.cu`); port the `slow_conv2d` behaviour. Covers multi-frame video VAE decode, which `ded5499` does not. Grouped convs on the slow backends (`SlowTranspose2d`, `Slow2d`, `SlowDilated*`) run one conv per group (`Convolution.cpp` group loop); `91d15cb` avoids it for the audio upsample only.
 - ROCm: HIP on PAL ignores `HIP_VISIBLE_DEVICES` order; AOTriton 0.14 gfx1201 kernels landed in release/2.13 after the 10.0.0 wheels.
 
@@ -197,7 +210,7 @@ Core EasyCache on H3: a third-party measurement found `end_percent` ≤ 0.70 giv
 | Attention backends per real shape (SDPA native/expanded, flash/efficient/math, kitchen int8, sol, VAE slice) | `tools/A1/attn_bench.py --device 1 --explain --profile` |
 | bf16 vs fp8 vs int8 linears, hipBLASLt vs rocBLAS, TunableOp | `tools/A2/gemm_bench.py --model <file> --tokens <n> --device 1` |
 | Top kernels per denoising step | `tools/A2/comfy_profile_step` (custom node; load via `extra_paths_profile.yaml` in the test instance only) |
-| comfy-kitchen patches against the installed 0.2.36 (phase 7 of the measurement prompt) | from `.claude/kitchen-r9700/`, patched build on `PYTHONPATH`: `check_fp8_quantize.py --ref`, `bench_fp8_gemm.py --ref`, `bench_fp8_gemm.py --sweep-tiles` |
+| comfy-kitchen round-2 patches against the installed kitchen (phase 7 of the measurement prompt) | from `.claude/kitchen-r9700/`, patched build on `PYTHONPATH`: `bench_rms_rope.py --ref`, `bench_rms_adaln.py --ref`, `bench_fp8_gemm.py --ref` |
 | Regression tests, patched and unpatched build (phase 1a of the measurement prompt) | `python -m pytest -p no:cacheprovider -rs <the 7 files above>` with `CUDA_VISIBLE_DEVICES=1`, `HIP_VISIBLE_DEVICES=1` |
 | Krea 2 fused kernels (`377a3f9`) | `tools/A2/krea2_block_bench.py --device 1 --tokens 4608` |
 | Model placement across cards, per-GPU peak VRAM, evictions | `tools/A3/run_placement_bench.py --model minimax\|krea2\|qi21 --placement single\|split` |
