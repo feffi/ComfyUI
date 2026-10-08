@@ -106,8 +106,9 @@ LDS, so 2 blocks per WGP. Per K tile and wave its loop has 64 WMMA, 12 VALU, 8 S
   expected grid. 2 sit just below the threshold.
 - **Coverage:** all Krea 2 shapes qualify, from 492 blocks (k/v, N = 1536) to 5248
   (MLP up). Qwen 2.1's M = 4096 shapes qualify too (512 blocks for N = 4096), but your
-  sweep did not cover them. If the bench shows a loss there, the threshold rises; the
-  rule stays fixed.
+  sweep did not cover them. If the bench shows a loss there, phase 7 marks 0007
+  inconclusive; the fix is then a fixed rule that leaves those shapes out, and a higher
+  block threshold alone would not do it (4096 x 4096 -> 24576 has 3072 blocks).
 
 ## Not done: the K = 16384 shape and the rest of the K = 6144 gap
 
